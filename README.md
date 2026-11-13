@@ -1,6 +1,8 @@
 # TWP Portal for Mac
 
-A native macOS companion for [thinkwith.pictures](https://thinkwith.pictures): link it to your account once, then build and edit scenes from a terminal-style window, in plain words or with direct commands. The language model and the image model are Apple's, running on the Mac. No API key, no model download.
+A native macOS companion for [thinkwith.pictures](https://thinkwith.pictures): link it to your account once, then build and edit scenes from a terminal-style window, in plain words or with direct commands. The language model and the image model are Apple's, running on the Mac. No API key, no model download. A local Qwen-Image server can optionally take over picture drawing and adds editing and filling.
+
+> **Needs macOS 27 on Apple silicon with Apple Intelligence turned on.** This first release is source only: build it yourself with the two commands under [Build and run](#build-and-run). Signed, ready-to-run downloads will come soon.
 
 It is a client of the site's Scene Builder MCP endpoint (`/api/twp/mcp`), the same one any MCP-capable assistant can connect to; see <https://thinkwith.pictures/agents>. Everything it does is done as the signed-in user and spends their strain exactly as the website would.
 
@@ -25,7 +27,9 @@ sh scripts/build.sh app    # also dist/TWP Portal.app and dist/TWP-Portal-mac.zi
 open "dist/TWP Portal.app"
 ```
 
-`swift build` also works on a healthy toolchain. `scripts/build.sh` calls `swiftc` directly, so it does not depend on SwiftPM.
+`scripts/build.sh` calls `swiftc` directly and is the tested way to build. A `Package.swift` is included for SwiftPM and Xcode users, but it has not been verified yet; please open an issue if `swift build` fails for you.
+
+An app built this way is signed ad hoc, which is fine on the Mac that built it.
 
 ## Using it
 
@@ -58,6 +62,18 @@ Pictures stay on the Mac until the user uploads one. The Local shelf is a plain 
 - `/upload <name>` (or **Upload** in the Local tab) is the one step that sends a picture to the TWP gallery, through `begin_image_upload` and a plain PUT to the one-time URL.
 - The agent's `generate_image` tool follows the same rule with one exception: when the same request goes on to use the picture ("draw a chest and add it to this scene"), it uploads at once, because the user asked for it to be used. A bare "draw me a mushroom" stays local.
 - Generation goes through Apple's Image Playground. The programmatic `ImageCreator` is tried first, but Apple deprecated it in macOS 27 and on the development Mac it always answers `notSupported`, so in practice the app opens the Image Playground sheet with the prompt and style filled in and takes the picture the user accepts. One picture per request. It needs the app window, so `/imagine` does not work from the bare `twp` binary.
+
+### Optional: bring your own Qwen-Image server
+
+Image Playground only draws new pictures. For editing and filling, and for drawing without the sheet, the portal can call a server you run yourself that serves Qwen-Image 2.1 on the same Mac or the local network. No such server ships with this project and none is needed for anything else; the contract is small (below) so one can be written around any Qwen-Image setup. It is off unless chosen:
+
+- `/pictures qwen-turbo` (8 steps, about a minute a picture) or `/pictures qwen` (40 steps, several minutes); `/pictures apple` goes back. `/pictures server <url>` sets the address (default `http://127.0.0.1:8740`).
+- `/imagine` then draws through the server: stickers come back with real transparency and are trimmed, backgrounds are 1216×832, and `x3` really makes three. It also works from the bare `twp` binary.
+- `/edit <name> <what to change>` repaints a picture as instructed and saves a copy.
+- `/fill <name> <area> <what>` paints into one rectangle (`left,top,width,height` in percent, or `bottom-left` and similar). The rectangle is marked in magenta for the model and the answer is blended back through a soft mask, so pixels outside it are untouched. In the app, **Fill…** on a Local picture opens a sheet to drag the box.
+- The light beside the input shows the model's state: hollow when not in memory, green when loaded, amber while working, red when the server is not answering. Its menu switches engine, unloads the model, and sets an idle time after which the portal unloads it (while the portal is open).
+
+The contract is one call, `POST /generate-image` with JSON `{prompt, model: "turbo"|"base", width, height, alpha, images: [base64…]}` answering with PNG bytes (`PictureEngine.swift`). Loaded state, step progress and unloading come from the daemon's unix socket (`status` and `unload` over `POST /rpc`), looked for at `$LOCALGEN_HOME/.run/daemon.sock` and `~/local-generators/.run/daemon.sock`, or set with `/pictures socket <path>`; without it pictures still work and the light only shows reachable or not.
 - Stickers must be transparent, so generated stickers and `/cutout` go through Vision's foreground-subject mask.
 
 ## Private Cloud Compute

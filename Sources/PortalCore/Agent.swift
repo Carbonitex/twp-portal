@@ -11,6 +11,8 @@ public enum PortalEvent: Sendable {
   case toolResult(name: String, text: String, isError: Bool)
   case image(Data, caption: String)
   case json(String)
+  /// A passing status line while something slow runs ("step 3 of 8"); not part of the transcript.
+  case progress(String)
 }
 
 /// Which Apple model answers. `onDevice` always works on an Apple Intelligence
@@ -50,6 +52,7 @@ struct AgentTool: @unchecked Sendable {
     "generate_image": "Draw a new picture from a text prompt on this Mac (background or sticker). It is kept on the Local shelf.",
     "upload_image_file": "Upload a picture from this Mac (a Local shelf name or a file path) and get its assetKey.",
     "list_local_pictures": "Pictures already made and waiting on this Mac's Local shelf, with their names.",
+    "edit_local_picture": "Change a picture that is on this Mac's Local shelf as instructed (recolour, restyle, add or remove something). Saves a new copy.",
     "place_objects": "Put stickers, items or clickable regions into a scene. Needs sceneId and an assetKey or itemId.",
     "update_objects": "Move, resize, rotate, label or relink objects already in a scene. Needs objectIds from get_scene.",
     "remove_objects": "Delete objects from a scene. Needs objectIds from get_scene.",
@@ -88,6 +91,7 @@ struct AgentTool: @unchecked Sendable {
     - add a newly drawn sticker: generate_image, place_objects
     - just draw or try out a picture, not using it yet: generate_image alone
     - use a picture made earlier that is on the Local shelf: list_local_pictures, upload_image_file, then place_objects or create_scene
+    - change or repaint a picture that is on the Local shelf: list_local_pictures, edit_local_picture
     - move, resize or delete something in a scene: get_scene, then update_objects or remove_objects
     - connect scenes: list_scenes, link_scenes
     - give players an item: list_placeable_items, place_objects
@@ -206,7 +210,7 @@ public final class PortalAgent: @unchecked Sendable {
   public var focusScene: (id: String, name: String)?
   public var userName = ""
   /// Replaced by the app so generation can fall back to the Image Playground sheet.
-  public var imageGenerator: @Sendable (String, String, Int) async throws -> [CGImage] = { try await ImagePipeline.generate(prompt: $0, style: $1, count: $2) }
+  public var imageGenerator: @Sendable (PictureRequest) async throws -> [CGImage] = { try await Pictures.draw($0) }
   /// Environment origin, used to remember where a Local picture was uploaded.
   public var origin = ""
   /// Set per turn: true when the routed tools include one that consumes a picture, so generate_image uploads at once.
@@ -312,8 +316,9 @@ public final class PortalAgent: @unchecked Sendable {
       run: { [emit] args in
         let purpose = ImagePurpose(rawValue: args["purpose"]?.stringValue ?? "") ?? .sticker
         let prompt = args["prompt"]?.stringValue ?? ""
-        guard var image = try await generator(prompt, args["style"]?.stringValue ?? "illustration", 1).first else { throw PortalError.image("No picture was created.") }
-        if purpose == .sticker { image = try ImagePipeline.cutout(image) }
+        guard var image = try await generator(PictureRequest(prompt: prompt, purpose: purpose, style: args["style"]?.stringValue ?? "illustration")).first else { throw PortalError.image("No picture was created.") }
+        // The Qwen engine draws stickers transparent already; Apple's pictures need their background removed.
+        if purpose == .sticker, !ImagePipeline.hasTransparency(image) { image = try ImagePipeline.cutout(image) }
         let item = try LocalShelf.save(image, purpose: purpose, label: prompt, prompt: prompt)
         if let data = try? Data(contentsOf: item.url) { emit(.image(data, caption: "\(item.name) · saved to Local")) }
         // The picture is uploaded straight away only when this same request goes on to use it in a scene or item.
@@ -356,6 +361,28 @@ public final class PortalAgent: @unchecked Sendable {
         }
         return MCPResult(isError: false, text: JSONValue.object(["pictures": .array(rows)]).serialized(), images: [])
       }))
+    // Editing exists only with the optional Qwen engine, so the tool is offered only then.
+    if PictureEngine.current.isQwen {
+      tools.append(AgentTool(
+        name: "edit_local_picture",
+        description: "Change a picture on this Mac's Local shelf as instructed, for example recolour it, restyle it, or add or remove something. Saves the result as a new Local picture and returns its name. It is not uploaded.",
+        inputSchema: [
+          "type": "object", "required": ["name", "instruction"],
+          "properties": [
+            "name": ["type": "string", "description": "Local shelf file name (see list_local_pictures)."],
+            "instruction": ["type": "string", "description": "What to change, in a short sentence."],
+          ],
+        ],
+        run: { [emit] args in
+          let name = args["name"]?.stringValue ?? ""
+          let instruction = args["instruction"]?.stringValue ?? ""
+          guard let item = LocalShelf.find(name) else { throw PortalError.tool("No Local picture called \"\(name)\". Call list_local_pictures for the names.") }
+          let edited = try await Pictures.edit(try ImagePipeline.load(item.url), instruction: instruction, progress: { emit(.progress($0)) })
+          let saved = try LocalShelf.save(edited, purpose: item.hasAlpha ? .sticker : .background, label: (item.name as NSString).deletingPathExtension + "-edit", prompt: instruction)
+          if let data = try? Data(contentsOf: saved.url) { emit(.image(data, caption: "\(saved.name) · saved to Local")) }
+          return MCPResult(isError: false, text: JSONValue.object(["savedAs": .string(saved.name), "uploaded": false, "next": "Kept on this Mac only. To use it, call upload_image_file with this name."]).serialized(), images: [])
+        }))
+    }
     return tools
   }
 

@@ -39,6 +39,25 @@ final class PortalModel: ObservableObject {
   @Published var starterScene: SceneSummary?
   @Published var shelf: [ShelfItem] = []
   @Published var selectedLocal: ShelfItem?
+  // Picture engine (Apple's Image Playground, or an optional local Qwen server).
+  @Published var pictureEngine: PictureEngine = .current
+  /// Loaded state of the Qwen model, polled while a Qwen engine is selected.
+  @Published var qwenStatus: QwenStatus?
+  @Published var autoOffMinutes: Int? = PortalConfig.load().picturesAutoOff
+  /// "step 3 of 8" while a picture renders.
+  @Published var progressText: String?
+  private var statusTimer: Timer?
+  private var runTask: Task<Void, Never>?
+  /// Bumped to send keyboard focus back to the input.
+  @Published var focusTick = 0
+
+  // The Fill sheet: drag a box on the picture, say what goes there.
+  @Published var fillItem: ShelfItem?
+  @Published var fillImage: NSImage?
+  /// The dragged box in fractions of the picture, from its top-left corner.
+  @Published var fillBox: CGRect = .zero
+  @Published var fillText = ""
+
   private var thumbnails: [String: NSImage] = [:]
   private var shelfObserver: NSObjectProtocol?
 
@@ -63,6 +82,102 @@ final class PortalModel: ObservableObject {
     shelfObserver = NotificationCenter.default.addObserver(forName: LocalShelf.didChange, object: nil, queue: .main) { [weak self] _ in
       Task { @MainActor in self?.reloadShelf() }
     }
+    statusTimer = Timer.scheduledTimer(withTimeInterval: 4, repeats: true) { [weak self] _ in
+      Task { @MainActor in self?.pollPictures() }
+    }
+    pollPictures()
+  }
+
+  // MARK: Picture engine
+
+  private var polling = false
+  private var pollCount = 0
+  private var serverUp = true
+
+  /// Reads the Qwen model's state for the status light and applies the auto-off setting.
+  /// The control socket is local and answers in milliseconds; the HTTP reachability check runs less often.
+  func pollPictures() {
+    guard pictureEngine.isQwen else {
+      qwenStatus = nil
+      return
+    }
+    guard !polling else { return }
+    polling = true
+    pollCount += 1
+    let checkServer = pollCount % 4 == 1
+    let autoOff = autoOffMinutes
+    Task.detached { [weak self] in
+      var status = QwenServer.status()
+      let up = checkServer ? await QwenServer.reachable() : nil
+      if let minutes = autoOff, status.state == .loaded, let idle = status.idleSeconds, idle >= minutes * 60, QwenServer.unload() {
+        status = QwenStatus(state: .unloaded)
+      }
+      let final = status
+      await MainActor.run {
+        guard let self else { return }
+        if let up { self.serverUp = up }
+        var shown = final
+        if !self.serverUp, shown.state == .unknown || shown.state == .unloaded { shown.state = .unreachable }
+        if self.qwenStatus != shown { self.qwenStatus = shown }
+        self.polling = false
+      }
+    }
+  }
+
+  func setPictureEngine(_ engine: PictureEngine) {
+    guard !busy else { return }
+    run("/pictures \(engine.rawValue)")
+  }
+
+  func unloadQwen() {
+    Task.detached { [weak self] in
+      let done = QwenServer.unload()
+      await MainActor.run {
+        self?.receive(.info(done ? "Unloaded the Qwen model; its memory is free. It loads again on the next picture." : "Nothing was unloaded (the model is not loaded, or is busy)."))
+        self?.pollPictures()
+      }
+    }
+  }
+
+  func setAutoOff(_ minutes: Int?) {
+    autoOffMinutes = minutes
+    var config = PortalConfig.load()
+    config.picturesAutoOff = minutes
+    config.save()
+  }
+
+  private func syncPictureSettings() {
+    pictureEngine = .current
+    autoOffMinutes = PortalConfig.load().picturesAutoOff
+    pollCount = 0
+    pollPictures()
+  }
+
+  /// Stops a picture that is being drawn (closing the request cancels the render on the server).
+  func stop() { runTask?.cancel() }
+
+  // MARK: Fill sheet
+
+  func beginFill(_ item: ShelfItem) {
+    fillImage = NSImage(contentsOf: item.url)
+    fillBox = .zero
+    fillText = ""
+    fillItem = item
+  }
+
+  var fillReady: Bool { fillBox.width >= 0.03 && fillBox.height >= 0.03 && !fillText.trimmingCharacters(in: .whitespaces).isEmpty }
+
+  func commitFill() {
+    guard let item = fillItem, fillReady else { return }
+    let area = FillArea(x: fillBox.minX, y: fillBox.minY, width: fillBox.width, height: fillBox.height)
+    let what = fillText.trimmingCharacters(in: .whitespaces)
+    fillItem = nil
+    run("/fill \(item.name) \(area.text) \(what)")
+  }
+
+  func beginEdit(_ item: ShelfItem) {
+    input = "/edit \(item.name) "
+    focusTick += 1
   }
 
   // MARK: Local shelf
@@ -101,13 +216,17 @@ final class PortalModel: ObservableObject {
     portal.agent.onFocusChange = { [weak self] id in
       DispatchQueue.main.async { Task { await self?.focusChanged(to: id) } }
     }
-    portal.agent.imageGenerator = { [weak self] prompt, style, count in
+    portal.agent.imageGenerator = { [weak self] request in
+      // The optional Qwen engine draws by itself; progress lands in the "Working…" row.
+      if PictureEngine.current.isQwen {
+        return try await Pictures.draw(request, progress: { text in DispatchQueue.main.async { self?.receive(.progress(text)) } })
+      }
       do {
-        return try await ImagePipeline.generate(prompt: prompt, style: style, count: count)
+        return try await ImagePipeline.generate(prompt: request.prompt, style: request.style, count: request.count)
       } catch PortalError.image {
         // Apple's programmatic generator is unavailable: let the user make the
         // picture in Image Playground, seeded with the same prompt.
-        guard let self, let url = await self.runPlayground(prompt, style: style) else { throw PortalError.image("No picture was created.") }
+        guard let self, let url = await self.runPlayground(request.prompt, style: request.style) else { throw PortalError.image("No picture was created.") }
         return [try ImagePipeline.load(url)]
       }
     }
@@ -195,10 +314,13 @@ final class PortalModel: ObservableObject {
     busy = true
     linking = line.trimmingCharacters(in: .whitespaces) == "/login"
     // Commands that put a picture on the shelf bring the shelf into view.
-    if ["/imagine", "/cutout", "/import", "/local"].contains(line.split(separator: " ").first.map(String.init) ?? "") { sidebarTab = .local }
-    Task {
+    if ["/imagine", "/cutout", "/import", "/local", "/edit", "/fill"].contains(line.split(separator: " ").first.map(String.init) ?? "") { sidebarTab = .local }
+    progressText = nil
+    runTask = Task {
       await portal.handle(line)
       linking = false
+      progressText = nil
+      if line.hasPrefix("/pictures") { syncPictureSettings() } else if pictureEngine.isQwen { pollPictures() }
       // Let queued events land before the prompt comes back.
       await withCheckedContinuation { c in DispatchQueue.main.async { c.resume() } }
       busy = false
@@ -234,6 +356,9 @@ final class PortalModel: ObservableObject {
       entries.append(Entry(kind: isError ? .toolError : .toolResult, text: "\(name): \(flat.prefix(220))\(flat.count > 220 ? "…" : "")"))
     case .json(let t): entries.append(Entry(kind: .json, text: t))
     case .image(let data, let caption): entries.append(Entry(kind: .image, text: caption, image: NSImage(data: data)))
+    case .progress(let t):
+      if busy { progressText = t }
+      return
     }
     if entries.count > 600 { entries.removeFirst(entries.count - 600) }
   }

@@ -71,6 +71,85 @@ public enum ImagePipeline {
     return out
   }
 
+  // MARK: Pixel helpers (stickers from the Qwen engine, edits and fills)
+
+  private static func bitmap(width: Int, height: Int) throws -> CGContext {
+    guard let ctx = CGContext(data: nil, width: width, height: height, bitsPerComponent: 8, bytesPerRow: width * 4, space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                              bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { throw PortalError.image("Couldn't allocate a picture buffer.") }
+    return ctx
+  }
+
+  public static func resized(_ image: CGImage, width: Int, height: Int) throws -> CGImage {
+    if image.width == width, image.height == height { return image }
+    let ctx = try bitmap(width: width, height: height)
+    ctx.interpolationQuality = .high
+    ctx.draw(image, in: CGRect(x: 0, y: 0, width: width, height: height))
+    guard let out = ctx.makeImage() else { throw PortalError.image("Couldn't resize the picture.") }
+    return out
+  }
+
+  /// The picture with one rectangle (bottom-left pixel coordinates) painted a flat colour.
+  static func painted(_ image: CGImage, rect: CGRect, red: CGFloat, green: CGFloat, blue: CGFloat) throws -> CGImage {
+    let ctx = try bitmap(width: image.width, height: image.height)
+    ctx.draw(image, in: CGRect(x: 0, y: 0, width: image.width, height: image.height))
+    ctx.setFillColor(red: red, green: green, blue: blue, alpha: 1)
+    ctx.fill(rect)
+    guard let out = ctx.makeImage() else { throw PortalError.image("Couldn't mark the picture.") }
+    return out
+  }
+
+  /// `top` inside `rect`, `bottom` everywhere else, with a soft edge a few pixels wide so no seam shows.
+  static func blend(_ top: CGImage, over bottom: CGImage, inside rect: CGRect) throws -> CGImage {
+    let extent = CGRect(x: 0, y: 0, width: bottom.width, height: bottom.height)
+    let feather = max(3, Double(min(bottom.width, bottom.height)) * 0.008)
+    let mask = CIImage(color: .white).cropped(to: rect.insetBy(dx: -feather, dy: -feather))
+      .composited(over: CIImage(color: .black).cropped(to: extent))
+      .clampedToExtent().applyingGaussianBlur(sigma: feather).cropped(to: extent)
+    let mixed = CIImage(cgImage: top).applyingFilter("CIBlendWithMask", parameters: [kCIInputBackgroundImageKey: CIImage(cgImage: bottom), kCIInputMaskImageKey: mask])
+    guard let out = CIContext().createCGImage(mixed, from: extent) else { throw PortalError.image("Couldn't blend the fill into the picture.") }
+    return out
+  }
+
+  private static func alphaBytes(_ image: CGImage) -> (bytes: [UInt8], width: Int, height: Int)? {
+    switch image.alphaInfo {
+    case .none, .noneSkipFirst, .noneSkipLast: return nil
+    default: break
+    }
+    let w = image.width, h = image.height
+    guard let ctx = try? bitmap(width: w, height: h), let data = { ctx.draw(image, in: CGRect(x: 0, y: 0, width: w, height: h)); return ctx.data }() else { return nil }
+    let rgba = data.bindMemory(to: UInt8.self, capacity: w * h * 4)
+    var bytes = [UInt8](repeating: 0, count: w * h)
+    for i in 0..<(w * h) { bytes[i] = rgba[i * 4 + 3] }
+    return (bytes, w, h)
+  }
+
+  /// True when a meaningful share of the picture is see-through (not just an unused alpha channel).
+  public static func hasTransparency(_ image: CGImage) -> Bool {
+    guard let alpha = alphaBytes(image) else { return false }
+    var clear = 0
+    for a in alpha.bytes where a < 16 { clear += 1 }
+    return clear * 200 > alpha.bytes.count
+  }
+
+  /// Crops away the empty margin around a transparent sticker, leaving a few pixels of breathing room.
+  public static func trimTransparent(_ image: CGImage) -> CGImage {
+    guard let alpha = alphaBytes(image) else { return image }
+    var minX = alpha.width, minY = alpha.height, maxX = -1, maxY = -1
+    for y in 0..<alpha.height {
+      let row = y * alpha.width
+      for x in 0..<alpha.width where alpha.bytes[row + x] > 12 {
+        if x < minX { minX = x }
+        if x > maxX { maxX = x }
+        if y < minY { minY = y }
+        if y > maxY { maxY = y }
+      }
+    }
+    guard maxX >= minX, maxY >= minY else { return image }
+    let pad = 6
+    let rect = CGRect(x: max(0, minX - pad), y: max(0, minY - pad), width: min(alpha.width, maxX + pad + 1) - max(0, minX - pad), height: min(alpha.height, maxY + pad + 1) - max(0, minY - pad))
+    return image.cropping(to: rect) ?? image
+  }
+
   public static func load(_ url: URL) throws -> CGImage {
     guard let src = CGImageSourceCreateWithURL(url as CFURL, nil), let image = CGImageSourceCreateImageAtIndex(src, 0, nil) else {
       throw PortalError.image("Couldn't read an image from \(url.lastPathComponent).")

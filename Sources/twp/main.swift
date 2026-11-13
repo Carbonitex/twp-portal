@@ -55,6 +55,9 @@ let portal = Portal(environment: environment) { event in
     try? data.write(to: url)
     print("image saved: \(url.path)")
   case .json(let text): print(text)
+  case .progress(let text):
+    // A passing status line: shown on a terminal, left out of piped output.
+    if colour { print(paint("  \(text)", "2")) }
   }
 }
 

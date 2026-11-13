@@ -58,6 +58,7 @@ struct RootView: View {
     } message: {
       Text(model.confirmQuestion ?? "")
     }
+    .sheet(isPresented: Binding(get: { model.fillItem != nil }, set: { if !$0 { model.fillItem = nil } })) { FillSheet() }
     .imagePlaygroundSheet(isPresented: $model.playgroundShown, concept: model.playgroundConcept) { url in
       model.playgroundFinished(url)
     } onCancellation: {
@@ -205,6 +206,15 @@ struct LocalShelfView: View {
           Button("Trash") { model.run("/discard \(item.name)") }.disabled(model.busy)
         }
         .controlSize(.small)
+        // Repainting needs the optional Qwen engine; Apple's Image Playground only draws new pictures.
+        if model.pictureEngine.isQwen {
+          HStack(spacing: 6) {
+            Button("Edit…") { model.beginEdit(item) }.disabled(model.busy).help("Describe a change; a repainted copy is saved here")
+            Button("Fill…") { model.beginFill(item) }.disabled(model.busy || item.hasAlpha)
+              .help(item.hasAlpha ? "Fill works on pictures without transparency; use Edit for stickers" : "Drag a box on the picture and say what to paint there")
+          }
+          .controlSize(.small)
+        }
       } else {
         Text("\(model.shelf.count) on this Mac").font(.caption).foregroundStyle(.secondary)
       }
@@ -223,6 +233,10 @@ struct ShelfActions: View {
     Button("Upload as Background") { model.run("/upload \(item.name) background") }.disabled(!model.signedIn)
     Divider()
     Button("Cut Out Background") { model.run("/cutout \(item.name)") }
+    if model.pictureEngine.isQwen {
+      Button("Edit…") { model.beginEdit(item) }
+      Button("Fill an Area…") { model.beginFill(item) }.disabled(item.hasAlpha)
+    }
     Button("Show in Finder") { NSWorkspace.shared.activateFileViewerSelecting([item.url]) }
     Divider()
     Button("Move to Trash") { model.run("/discard \(item.name)") }
@@ -282,7 +296,9 @@ struct Terminal: View {
                   Button("Open the page again") { model.reopenLinkPage() }.controlSize(.small)
                   Button("Cancel") { model.cancelLinking() }.controlSize(.small)
                 } else {
-                  Text("Working…").foregroundStyle(Palette.dim)
+                  Text(model.progressText.map { "Drawing · \($0)" } ?? "Working…").foregroundStyle(Palette.dim)
+                  // Only a Qwen render reports progress, and only that can be stopped cleanly.
+                  if model.progressText != nil { Button("Stop") { model.stop() }.controlSize(.small) }
                 }
               }
               .id("busy")
@@ -325,6 +341,7 @@ struct Terminal: View {
         }
         .buttonStyle(.plain)
         .help("Suggestions")
+        PictureLight()
         Menu(model.brain.rawValue) {
           ForEach(Brain.allCases, id: \.self) { brain in
             Button("\(brain.rawValue): \(PortalAgent.availability(brain).detail)") {
@@ -355,6 +372,7 @@ struct Terminal: View {
     }
     .onAppear { inputFocused = true }
     .onChange(of: model.busy) { _, busy in if !busy { inputFocused = true } }
+    .onChange(of: model.focusTick) { _, _ in inputFocused = true }
   }
 }
 
@@ -450,5 +468,115 @@ struct Inspector: View {
     }
     .padding(14)
     .background(Palette.panel)
+  }
+}
+
+// MARK: - Picture engine light
+
+/// A small light by the input: grey for Apple's engine; for the optional Qwen
+/// server, hollow when the model is not in memory, green when loaded, amber
+/// while it works and red when the server is not answering. Clicking it opens
+/// the engine choice, "unload now" and the auto-unload timer.
+struct PictureLight: View {
+  @EnvironmentObject var model: PortalModel
+
+  private var colour: Color {
+    guard model.pictureEngine.isQwen else { return Palette.dim.opacity(0.7) }
+    switch model.qwenStatus?.state {
+    case .loaded: return Color(red: 0.35, green: 0.86, blue: 0.45)
+    case .busy: return Color(red: 1.0, green: 0.72, blue: 0.25)
+    case .unreachable: return Palette.danger
+    default: return Palette.dim
+    }
+  }
+  private var symbol: String {
+    guard model.pictureEngine.isQwen else { return "circle.fill" }
+    switch model.qwenStatus?.state {
+    case .loaded, .busy, .unreachable: return "circle.fill"
+    default: return "circle"
+    }
+  }
+  private var statusLine: String {
+    guard model.pictureEngine.isQwen else { return "Pictures are drawn with Apple's Image Playground" }
+    return model.qwenStatus?.summary ?? "Checking the Qwen server…"
+  }
+  private static let autoOffChoices = [2, 5, 10, 30, 60]
+
+  var body: some View {
+    Menu {
+      Text(statusLine)
+      if model.pictureEngine.isQwen {
+        Button("Unload Model Now") { model.unloadQwen() }.disabled(model.qwenStatus?.state != .loaded)
+        Menu("Unload Automatically") {
+          ForEach(Self.autoOffChoices, id: \.self) { minutes in
+            Button("\(model.autoOffMinutes == minutes ? "✓ " : "   ")After \(minutes) idle minutes") { model.setAutoOff(minutes) }
+          }
+          Button("\(model.autoOffMinutes == nil ? "✓ " : "   ")Leave it to the server") { model.setAutoOff(nil) }
+        }
+      }
+      Divider()
+      ForEach(PictureEngine.allCases, id: \.self) { engine in
+        Button("\(model.pictureEngine == engine ? "✓ " : "   ")\(engine.label)") { model.setPictureEngine(engine) }.disabled(model.busy)
+      }
+    } label: {
+      HStack(spacing: 5) {
+        Image(systemName: symbol).font(.system(size: 8)).foregroundStyle(colour)
+        Text(model.pictureEngine.shortLabel).foregroundStyle(Palette.dim)
+      }
+    }
+    .menuStyle(.button).buttonStyle(.plain).menuIndicator(.hidden).fixedSize()
+    .help(statusLine)
+  }
+}
+
+// MARK: - Fill sheet
+
+/// Drag a box over part of a picture and say what to paint there.
+struct FillSheet: View {
+  @EnvironmentObject var model: PortalModel
+
+  var body: some View {
+    VStack(alignment: .leading, spacing: 12) {
+      Text("Fill part of \(model.fillItem?.name ?? "the picture")").font(.headline)
+      Text("Drag a box over the area to repaint, then say what belongs there. Everything outside the box stays exactly as it is, and the result is saved as a new Local picture.")
+        .font(.caption).foregroundStyle(.secondary)
+      if let image = model.fillImage {
+        Image(nsImage: image).resizable().scaledToFit()
+          .overlay {
+            GeometryReader { geo in
+              let box = model.fillBox
+              ZStack(alignment: .topLeading) {
+                Color.black.opacity(0.001)
+                if box.width > 0, box.height > 0 {
+                  Rectangle().fill(Palette.accent.opacity(0.22))
+                    .overlay(Rectangle().stroke(Palette.accent, style: StrokeStyle(lineWidth: 2, dash: [6, 4])))
+                    .frame(width: box.width * geo.size.width, height: box.height * geo.size.height)
+                    .offset(x: box.minX * geo.size.width, y: box.minY * geo.size.height)
+                }
+              }
+              .contentShape(Rectangle())
+              .gesture(DragGesture(minimumDistance: 2).onChanged { drag in
+                func unit(_ value: CGFloat, _ span: CGFloat) -> CGFloat { min(max(value / max(span, 1), 0), 1) }
+                let x0 = unit(drag.startLocation.x, geo.size.width), y0 = unit(drag.startLocation.y, geo.size.height)
+                let x1 = unit(drag.location.x, geo.size.width), y1 = unit(drag.location.y, geo.size.height)
+                model.fillBox = CGRect(x: min(x0, x1), y: min(y0, y1), width: abs(x1 - x0), height: abs(y1 - y0))
+              })
+            }
+          }
+          .clipShape(RoundedRectangle(cornerRadius: 6))
+          .frame(maxWidth: 720, maxHeight: 460)
+      }
+      TextField("What goes in the box? e.g. a red rowing boat", text: $model.fillText)
+        .textFieldStyle(.roundedBorder)
+        .onSubmit { model.commitFill() }
+      HStack {
+        Text("Drawn with \(model.pictureEngine.label).").font(.caption).foregroundStyle(.secondary)
+        Spacer()
+        Button("Cancel") { model.fillItem = nil }.keyboardShortcut(.cancelAction)
+        Button("Fill") { model.commitFill() }.keyboardShortcut(.defaultAction).disabled(!model.fillReady)
+      }
+    }
+    .padding(18)
+    .frame(minWidth: 520)
   }
 }

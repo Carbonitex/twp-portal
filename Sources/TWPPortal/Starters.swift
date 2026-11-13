@@ -32,6 +32,9 @@ struct SlashCommand: Identifiable {
     .init(name: "/open", usage: "/open [id]", summary: "Open a scene in the browser"),
     .init(name: "/imagine", usage: "/imagine <text> [--background]", summary: "Draw a picture, kept on this Mac"),
     .init(name: "/cutout", usage: "/cutout <name or file>", summary: "Remove a picture's background"),
+    .init(name: "/edit", usage: "/edit <name or file> <what to change>", summary: "Repaint a picture as instructed (Qwen engine)"),
+    .init(name: "/fill", usage: "/fill <name or file> <area> <what>", summary: "Paint something into part of a picture (Qwen engine)"),
+    .init(name: "/pictures", usage: "/pictures [apple|qwen-turbo|qwen]", summary: "Which engine draws pictures"),
     .init(name: "/local", usage: "/local", summary: "Pictures on this Mac"),
     .init(name: "/import", usage: "/import <file>", summary: "Copy a picture onto the Local shelf"),
     .init(name: "/upload", usage: "/upload <name or file> [sticker|background]", summary: "Send a picture to your TWP gallery"),
@@ -88,6 +91,9 @@ extension PortalModel {
     ]
     if let newest = shelf.first(where: { !isUploaded($0) }) {
       pictures.append(.init(icon: "icloud.and.arrow.up", title: "Upload \(newest.name)", text: "/upload \(newest.name) \(newest.suggestedPurpose.rawValue)"))
+    }
+    if pictureEngine.isQwen, let newest = shelf.first {
+      pictures.append(.init(icon: "paintpalette", title: "Repaint \(newest.name)", text: "/edit \(newest.name) make it night time with a full moon"))
     }
     groups.append(StarterGroup(title: "Pictures (kept on this Mac until you upload)", prompts: pictures))
     return groups
