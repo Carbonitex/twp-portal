@@ -68,6 +68,8 @@ args.removeAll { $0 == "--yes" }
 portal.agent.confirm = { question in
   if assumeYes { return true }
   guard isatty(STDIN_FILENO) != 0 else {
+    // Not done, so the run did not do what was asked: the exit status says so.
+    failed.value = true
     print("Refused without confirmation: \(question) (re-run with --yes to allow)")
     return false
   }
@@ -87,6 +89,9 @@ if let first = args.first {
   exit(failed.value ? 1 : 0)
 }
 
+// Fed by a pipe or file, the prompt is a script: any failed line makes the exit status non-zero.
+// At a keyboard, errors were seen as they happened, so a normal quit exits 0.
+let scripted = isatty(STDIN_FILENO) == 0
 print("TWP Portal · \(environment.displayName) (\(environment.origin.host ?? "")). /help lists commands, Ctrl-D quits.")
 if await portal.auth.isSignedIn { await portal.handle("/whoami") } else { print("Not linked yet. Type /login.") }
 while true {
@@ -95,3 +100,4 @@ while true {
   if ["exit", "quit", "/exit", "/quit"].contains(line.trimmingCharacters(in: .whitespaces)) { break }
   await portal.handle(line)
 }
+exit(scripted && failed.value ? 1 : 0)

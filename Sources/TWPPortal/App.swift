@@ -132,33 +132,80 @@ struct SceneListView: View {
   var body: some View {
     TextField("Filter scenes", text: $model.sceneFilter).textFieldStyle(.roundedBorder).padding(.horizontal, 12).padding(.vertical, 8)
     List(selection: Binding(get: { model.focus }, set: { model.select($0) })) {
-      ForEach(model.visibleScenes) { scene in
-        HStack(spacing: 6) {
-          Circle().fill(scene.isPublic ? Palette.accent : Color.secondary.opacity(0.4)).frame(width: 7, height: 7)
-            .help(scene.isPublic ? "Public" : "Draft")
-          Text(scene.name).lineLimit(1)
-          Spacer()
-          Text("\(scene.objectCount)").font(.caption).foregroundStyle(.secondary)
-        }
-        .tag(scene)
-        .contextMenu {
-          Button("Open in Browser") { model.openInBrowser(scene) }
-          Button("Copy Scene ID") {
-            NSPasteboard.general.clearContents()
-            NSPasteboard.general.setString(scene.id, forType: .string)
-          }
-        }
+      if !model.sceneFilter.isEmpty || model.folders.isEmpty {
+        // Searching (or an account with no folders): one flat list, each hit captioned with its folder.
+        ForEach(model.visibleScenes) { scene in SceneRow(scene: scene, folder: model.folderName(scene.folderId)).tag(scene) }
+      } else {
+        FolderContents(folder: nil)
       }
     }
     .listStyle(.sidebar)
     .overlay { if model.scenes.isEmpty { Text("No scenes yet").foregroundStyle(.secondary) } }
     Divider()
     HStack {
-      Text("\(model.scenes.count) scenes").font(.caption).foregroundStyle(.secondary)
+      Text(model.folders.isEmpty ? "\(model.scenes.count) scenes" : "\(model.scenes.count) scenes · \(model.folders.count) folders").font(.caption).foregroundStyle(.secondary)
       Spacer()
       Button("Unlink") { model.run("/logout") }.buttonStyle(.link).font(.caption).disabled(model.busy)
     }
     .padding(.horizontal, 12).padding(.vertical, 8)
+  }
+}
+
+/// One level of the folder tree: its subfolders (each opens to show its own level), then its scenes.
+struct FolderContents: View {
+  @EnvironmentObject var model: PortalModel
+  let folder: String?
+
+  var body: some View {
+    ForEach(model.childFolders(of: folder)) { child in
+      DisclosureGroup(isExpanded: Binding(
+        get: { model.openFolders.contains(child.id) },
+        set: { open in if open { model.openFolders.insert(child.id) } else { model.openFolders.remove(child.id) } }
+      )) {
+        FolderContents(folder: child.id)
+      } label: {
+        HStack(spacing: 6) {
+          Image(systemName: "folder").foregroundStyle(Palette.dim).font(.system(size: 11))
+          Text(child.name).lineLimit(1)
+          Spacer()
+          Text("\(model.sceneCount(inside: child.id))").font(.caption).foregroundStyle(.secondary)
+        }
+        .contextMenu {
+          Button("Copy Folder ID") {
+            NSPasteboard.general.clearContents()
+            NSPasteboard.general.setString(child.id, forType: .string)
+          }
+        }
+      }
+    }
+    ForEach(model.scenes(in: folder)) { scene in SceneRow(scene: scene, folder: nil).tag(scene) }
+  }
+}
+
+struct SceneRow: View {
+  @EnvironmentObject var model: PortalModel
+  let scene: SceneSummary
+  /// Shown under the name in search results, where the tree is flattened.
+  let folder: String?
+
+  var body: some View {
+    HStack(spacing: 6) {
+      Circle().fill(scene.isPublic ? Palette.accent : Color.secondary.opacity(0.4)).frame(width: 7, height: 7)
+        .help(scene.isPublic ? "Public" : "Draft")
+      VStack(alignment: .leading, spacing: 1) {
+        Text(scene.name).lineLimit(1)
+        if let folder { Text(folder).font(.caption2).foregroundStyle(.secondary).lineLimit(1) }
+      }
+      Spacer()
+      Text("\(scene.objectCount)").font(.caption).foregroundStyle(.secondary)
+    }
+    .contextMenu {
+      Button("Open in Browser") { model.openInBrowser(scene) }
+      Button("Copy Scene ID") {
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(scene.id, forType: .string)
+      }
+    }
   }
 }
 
@@ -296,8 +343,8 @@ struct Terminal: View {
                   Button("Open the page again") { model.reopenLinkPage() }.controlSize(.small)
                   Button("Cancel") { model.cancelLinking() }.controlSize(.small)
                 } else {
-                  Text(model.progressText.map { "Drawing · \($0)" } ?? "Working…").foregroundStyle(Palette.dim)
-                  // Only a Qwen render reports progress, and only that can be stopped cleanly.
+                  Text(model.progressText.map { "Working · \($0)" } ?? "Working…").foregroundStyle(Palette.dim)
+                  // Qwen renders and local-model requests report progress, and both stop cleanly when their request is closed.
                   if model.progressText != nil { Button("Stop") { model.stop() }.controlSize(.small) }
                 }
               }
@@ -342,16 +389,25 @@ struct Terminal: View {
         .buttonStyle(.plain)
         .help("Suggestions")
         PictureLight()
-        Menu(model.brain.rawValue) {
+        Menu(model.brain == .local ? (model.localBrain.model ?? "local") : model.brain.rawValue) {
           ForEach(Brain.allCases, id: \.self) { brain in
-            Button("\(brain.rawValue): \(PortalAgent.availability(brain).detail)") {
+            Button("\(model.brain == brain ? "✓ " : "   ")\(brain.rawValue): \(brain == .local ? model.localBrain.detail : PortalAgent.availability(brain).detail)") {
               model.run("/brain \(brain.rawValue)")
-              model.brain = brain
+            }
+          }
+          // The user's own model server: pick which of its models answers.
+          if model.brain == .local, model.localBrain.models.count > 1 {
+            Divider()
+            Menu("Local Model") {
+              ForEach(model.localBrain.models, id: \.self) { name in
+                Button("\(model.localBrain.model == name ? "✓ " : "   ")\(name)") { model.run("/brain model \(name)") }
+              }
             }
           }
         }
+        .disabled(model.busy)
         .menuStyle(.borderlessButton).fixedSize().foregroundStyle(Palette.dim)
-        .help("Which Apple model answers plain-language requests")
+        .help("Which model answers plain-language requests: Apple's, or your own local model server")
       }
       .padding(.horizontal, 14).padding(.vertical, 11)
       .background(Palette.panel)

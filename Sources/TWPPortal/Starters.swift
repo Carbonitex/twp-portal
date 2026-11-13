@@ -42,7 +42,7 @@ struct SlashCommand: Identifiable {
     .init(name: "/whoami", usage: "/whoami", summary: "Account and strain"),
     .init(name: "/tools", usage: "/tools", summary: "Every tool the server offers"),
     .init(name: "/call", usage: "/call <tool> <json>", summary: "Run one tool directly"),
-    .init(name: "/brain", usage: "/brain [on-device|private-cloud]", summary: "Which Apple model answers"),
+    .init(name: "/brain", usage: "/brain [on-device|private-cloud|local]", summary: "Which model answers"),
     .init(name: "/clear", usage: "/clear", summary: "Forget the conversation so far"),
     .init(name: "/login", usage: "/login", summary: "Link this Mac to your TWP account"),
     .init(name: "/logout", usage: "/logout", summary: "Unlink this Mac"),

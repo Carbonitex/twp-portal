@@ -15,12 +15,24 @@ public enum PortalEvent: Sendable {
   case progress(String)
 }
 
-/// Which Apple model answers. `onDevice` always works on an Apple Intelligence
+/// Which model answers. `onDevice` always works on an Apple Intelligence
 /// Mac. `privateCloud` is Apple's larger server model; it needs a managed
 /// entitlement from Apple, so it only works in a properly signed build.
+/// `local` is a model server the user runs themselves (see `LocalBrain`).
 public enum Brain: String, Sendable, CaseIterable {
   case onDevice = "on-device"
   case privateCloud = "private-cloud"
+  case local
+}
+
+/// What happens before a risky tool runs.
+public enum Gate: Sendable, Equatable {
+  /// Run it without asking.
+  case proceed
+  /// Ask the user this question first.
+  case ask(String)
+  /// Never run it and never ask: the arguments are wrong (made-up ids). The text goes back to the model.
+  case reject(String)
 }
 
 /// One tool the model may call: an MCP tool on the TWP server, or a local one
@@ -29,8 +41,9 @@ struct AgentTool: @unchecked Sendable {
   let name: String
   let description: String
   let inputSchema: JSONValue
-  /// Asked of the user before the tool runs; nil means no confirmation.
-  var confirmation: ((JSONValue) -> String?)?
+  /// Checked before the tool runs: may ask the user, or refuse malformed arguments
+  /// outright (no question shown); nil means no confirmation.
+  var confirmation: (@Sendable (JSONValue) async -> Gate)?
   let run: (JSONValue) async throws -> MCPResult
 
   /// One-line purpose shown to the tool router. The server's descriptions are
@@ -124,11 +137,24 @@ private struct BridgedTool: Tool, @unchecked Sendable {
   var description: String { tool.description.count > 320 ? String(tool.description.prefix(319)) + "…" : tool.description }
 
   func call(arguments: GeneratedContent) async throws -> String {
-    let args = bridge.arguments(from: arguments, inputSchema: tool.inputSchema)
+    await Self.execute(tool, bridge.arguments(from: arguments, inputSchema: tool.inputSchema), outputLimit: outputLimit, emit: emit, confirm: confirm, remember: remember, touched: touched)
+  }
+
+  /// Runs one tool call for any brain: shows it, asks first when it is risky, compacts the result.
+  static func execute(_ tool: AgentTool, _ args: JSONValue, outputLimit: Int, emit: @Sendable (PortalEvent) -> Void, confirm: @Sendable (String) async -> Bool,
+                      remember: @Sendable (String, String) -> Void, touched: @Sendable (String, String?) -> Void) async -> String {
     emit(.toolCall(name: tool.name, arguments: args.serialized()))
-    if let question = tool.confirmation?(args), await !confirm(question) {
-      emit(.toolResult(name: tool.name, text: "Cancelled by the user.", isError: true))
-      return "The user declined this action. Do not retry it; tell them it was not done."
+    switch await tool.confirmation?(args) ?? .proceed {
+    case .proceed: break
+    case .reject(let reason):
+      // Malformed arguments never become a question for the user: the model gets the reason and can look the ids up.
+      emit(.toolResult(name: tool.name, text: reason, isError: true))
+      return "ERROR: \(reason)"
+    case .ask(let question):
+      if await !confirm(question) {
+        emit(.toolResult(name: tool.name, text: "Cancelled by the user.", isError: true))
+        return "The user declined this action. Do not retry it; tell them it was not done."
+      }
     }
     do {
       let result = try await tool.run(args)
@@ -273,6 +299,10 @@ public final class PortalAgent: @unchecked Sendable {
     case .privateCloud:
       let model = PrivateCloudComputeLanguageModel()
       return model.isAvailable ? (true, "reported available (needs Apple's Private Cloud Compute entitlement to answer)") : (false, "unavailable")
+    case .local:
+      // From the last check, so menus never wait on the network; Portal.handle checks afresh before a request.
+      let status = LocalBrain.lastStatus
+      return (status.ok, status.detail)
     }
   }
 
@@ -280,6 +310,7 @@ public final class PortalAgent: @unchecked Sendable {
     switch brain {
     case .onDevice: return SystemLanguageModel.default.contextSize
     case .privateCloud: return (try? await PrivateCloudComputeLanguageModel().contextSize) ?? 32768
+    case .local: return LocalBrain.contextSize
     }
   }
 
@@ -287,6 +318,7 @@ public final class PortalAgent: @unchecked Sendable {
     switch brain {
     case .onDevice: return LanguageModelSession(model: SystemLanguageModel.default, tools: tools, instructions: instructions)
     case .privateCloud: return LanguageModelSession(model: PrivateCloudComputeLanguageModel(), tools: tools, instructions: instructions)
+    case .local: return LanguageModelSession(model: SystemLanguageModel.default, tools: tools, instructions: instructions)  // never used: local requests go through LocalBrain
     }
   }
 
@@ -295,7 +327,7 @@ public final class PortalAgent: @unchecked Sendable {
   private func allTools() async throws -> [AgentTool] {
     let mcp = self.mcp
     var tools = try await mcp.tools().filter { !Self.hidden.contains($0.name) }.map { t in
-      AgentTool(name: t.name, description: t.description, inputSchema: t.inputSchema, confirmation: Self.confirmation(for: t.name)) { args in
+      AgentTool(name: t.name, description: t.description, inputSchema: t.inputSchema, confirmation: Self.confirmation(for: t.name, mcp: mcp)) { args in
         try await mcp.call(t.name, args)
       }
     }
@@ -387,20 +419,74 @@ public final class PortalAgent: @unchecked Sendable {
   }
 
   /// Actions the user must approve in the moment, whatever the model decides.
-  static func confirmation(for tool: String) -> ((JSONValue) -> String?)? {
+  /// Arguments are checked first: a call with made-up ids is sent back to the
+  /// model as an error and never reaches the user as a question.
+  static func confirmation(for tool: String, mcp: MCPClient) -> (@Sendable (JSONValue) async -> Gate)? {
     switch tool {
     case "publish_scene":
       return { args in
-        (args["public"]?.boolValue ?? true) ? "Publish scene \(args["sceneId"]?.stringValue ?? "?") so anyone can visit it?" : nil
+        guard args["public"]?.boolValue ?? true else { return .proceed }
+        if let bad = badId(args["sceneId"], field: "sceneId") { return .reject(bad) }
+        return .ask("Publish scene \(args["sceneId"]?.stringValue ?? "?") so anyone can visit it?")
       }
     case "remove_objects":
-      return { args in "Remove \(args["objectIds"]?.arrayValue?.count ?? 0) object(s) from scene \(args["sceneId"]?.stringValue ?? "?")?" }
+      return { args in await removeObjectsGate(args, mcp: mcp) }
     case "api_call":
       return { args in
-        (args["confirm"]?.boolValue ?? false) ? "Run the destructive operation \"\(args["op"]?.stringValue ?? "?")\"?" : nil
+        (args["confirm"]?.boolValue ?? false) ? .ask("Run the destructive operation \"\(args["op"]?.stringValue ?? "?")\"?") : .proceed
       }
     default: return nil
     }
+  }
+
+  /// Real scene, object and item ids are long digit strings (18 digits today).
+  static func isRealId(_ text: String) -> Bool {
+    (15...20).contains(text.count) && text.allSatisfy { $0.isASCII && $0.isNumber }
+  }
+
+  /// Nil when `value` looks like a real id; otherwise the error the model reads.
+  static func badId(_ value: JSONValue?, field: String) -> String? {
+    guard let text = value?.stringValue, !text.isEmpty else {
+      return "\(field) is missing. Look it up first (list_scenes for scenes, get_scene for the objects in a scene) and pass the id as a string."
+    }
+    guard isRealId(text) else {
+      return "\(field) \"\(text)\" is not a real id. Ids are long digit strings (18 digits) that come from a tool: look it up with list_scenes or get_scene and pass it exactly, in quotes. Never make one up from a name."
+    }
+    return nil
+  }
+
+  /// remove_objects: checks the ids, then looks the scene up so the question
+  /// names what goes and ids that are not in that scene are refused.
+  static func removeObjectsGate(_ args: JSONValue, mcp: MCPClient) async -> Gate {
+    if let bad = badId(args["sceneId"], field: "sceneId") { return .reject(bad) }
+    let sceneId = args["sceneId"]?.stringValue ?? ""
+    let ids = args["objectIds"]?.arrayValue ?? []
+    guard !ids.isEmpty else { return .reject("objectIds is empty. Call get_scene with sceneId \"\(sceneId)\" to find the ids of the objects to remove.") }
+    let texts = ids.map { $0.stringValue ?? "" }
+    let malformed = texts.filter { !isRealId($0) }
+    if !malformed.isEmpty {
+      return .reject("objectIds \(malformed.map { "\"\($0)\"" }.joined(separator: ", ")) \(malformed.count == 1 ? "is not a real id" : "are not real ids"). Object ids are long digit strings (18 digits): call get_scene with sceneId \"\(sceneId)\" and use the id of each object, in quotes. Never make one up from a name.")
+    }
+    let fallback = Gate.ask("Remove \(ids.count) object(s) from scene \(sceneId)?")
+    guard let result = try? await mcp.call("get_scene", ["sceneId": .string(sceneId)]), !result.isError,
+          let scene = result.json, let objects = scene["objects"]?.arrayValue
+    else { return fallback }
+    var names: [String: String] = [:]
+    for o in objects {
+      guard let id = o["id"]?.stringValue else { continue }
+      let label = o["label"]?.stringValue ?? ""
+      names[id] = label.isEmpty ? "a \(o["kind"]?.stringValue ?? "object") (\(id))" : "\"\(label)\""
+    }
+    let sceneName = scene["name"]?.stringValue.map { "\"\($0)\"" } ?? "scene \(sceneId)"
+    let missing = texts.filter { names[$0] == nil }
+    if !missing.isEmpty {
+      return .reject("\(missing.map { "\"\($0)\"" }.joined(separator: ", ")) \(missing.count == 1 ? "is not an object" : "are not objects") in \(sceneName) (sceneId \"\(sceneId)\"). Call get_scene with that sceneId and use the ids it lists.")
+    }
+    var unique: [String] = []
+    for t in texts where !unique.contains(t) { unique.append(t) }
+    let first = names[unique[0]]!
+    let what = unique.count == 1 ? first : "\(first) and \(unique.count - 1) other object\(unique.count == 2 ? "" : "s")"
+    return .ask("Remove \(what) from \(sceneName)?")
   }
 
   /// Picks the few tools a request needs. The on-device model's whole context is
@@ -449,7 +535,8 @@ public final class PortalAgent: @unchecked Sendable {
     if !context.isEmpty { context += "\n" }
 
     var chosen: [AgentTool]
-    if all.reduce(0, { $0 + $1.estimatedTokens }) <= toolBudget {
+    // A local model server gets every tool: its window is large, and routing would need Apple's model.
+    if brain == .local || all.reduce(0, { $0 + $1.estimatedTokens }) <= toolBudget {
       chosen = all
     } else {
       chosen = await route(request, tools: all, context: context)
@@ -463,11 +550,13 @@ public final class PortalAgent: @unchecked Sendable {
     if chosen.contains(where: { $0.name == "generate_image" }) {
       let wantsUse = Self.asksToUsePicture(request)
       if !wantsUse, chosen.count < all.count { chosen.removeAll { Self.pictureConsumers.contains($0.name) } }
-      useGeneratedNow.value = wantsUse && chosen.count < all.count
+      // With every tool on offer (a local model server) nothing is withheld, so the same test decides alone.
+      useGeneratedNow.value = wantsUse && (chosen.count < all.count || brain == .local)
     } else {
       useGeneratedNow.value = false
     }
-    if !chosen.isEmpty { emit(.info("tools: " + chosen.map(\.name).joined(separator: ", "))) }
+    // Worth showing when the router narrowed the set; noise when every tool is on offer.
+    if !chosen.isEmpty, chosen.count < all.count { emit(.info("tools: " + chosen.map(\.name).joined(separator: ", "))) }
 
     let instructions = """
       You operate thinkwith.pictures (TWP), a world of clickable picture scenes, for the signed-in user\(userName.isEmpty ? "" : " \(userName)").
@@ -477,11 +566,24 @@ public final class PortalAgent: @unchecked Sendable {
       Fill in only the arguments the request calls for; leave every other optional argument out.
       When placing a new sticker, give it a width between 120 and 260 unless the user asks for a size.
       A picture that generate_image returns without an assetKey is saved on this Mac only: say so, and do not place it.
+      Upload a picture from this Mac only when the user asks for it to be used or uploaded; drawing or editing alone keeps it local.
       If a search finds nothing, stop and tell the user; offer to draw the picture instead. Never place an object without an assetKey or itemId.
       Scenes start as private drafts. Do not publish unless the user asks.
+      In whoami, strain.current is the strain the user has LEFT to spend (their balance), out of strain.max.
       When finished, say what changed in one or two plain sentences. If a tool returns ERROR, explain it simply.
       """
 
+    if brain == .local {
+      let emit = self.emit
+      let confirm = self.confirm
+      let reply = try await LocalBrain.respond(system: instructions, user: context + request, tools: chosen, progress: { emit(.progress($0)) }) { [weak self] tool, args in
+        await BridgedTool.execute(
+          tool, args, outputLimit: 6000, emit: emit, confirm: confirm,
+          remember: { name, text in self?.note(name, text) },
+          touched: { id, name in self?.touch(id, name) })
+      }
+      return finish(request, reply)
+    }
     do {
       let reply = try await run(request: request, context: context, tools: chosen, instructions: instructions, small: small)
       return finish(request, reply)
@@ -513,17 +615,19 @@ public final class PortalAgent: @unchecked Sendable {
         tool: tool, bridge: bridge, parameters: try bridge.generationSchema(toolName: tool.name, inputSchema: tool.inputSchema),
         outputLimit: small ? 1400 : 6000, emit: emit, confirm: confirm,
         remember: { [weak self] name, text in self?.note(name, text) },
-        touched: { [weak self] id, name in
-          guard let self else { return }
-          let known = self.focusScene?.id == id ? self.focusScene?.name : nil
-          self.focusScene = (id, name ?? known ?? "scene \(id)")
-          self.onFocusChange?(id)
-        })
+        touched: { [weak self] id, name in self?.touch(id, name) })
     }
     var options = GenerationOptions()
     options.temperature = 0.2
     let live = session(tools: bridged, instructions: instructions)
     return try await live.respond(to: context + request, options: options).content
+  }
+
+  /// A successful call worked on this scene, so it becomes "this scene".
+  private func touch(_ id: String, _ name: String?) {
+    let known = focusScene?.id == id ? focusScene?.name : nil
+    focusScene = (id, name ?? known ?? "scene \(id)")
+    onFocusChange?(id)
   }
 
   private func finish(_ request: String, _ reply: String) -> String {

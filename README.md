@@ -54,6 +54,30 @@ Tool output is compacted before the model sees it, and a short memory (recent tu
 
 Expect the on-device model to handle one- to three-step requests well and to struggle with long plans. `/call` reaches every tool with full arguments.
 
+### Optional: your own local model
+
+For longer plans, the portal can hand plain-language requests to a model server you run yourself instead of Apple's model: anything that speaks the OpenAI chat-completions API with tool calling, such as [Ollama](https://ollama.com), llama.cpp's `llama-server` or LM Studio, with whatever GGUF or MLX model you like. Nothing ships with the portal and Apple's model stays the default.
+
+- `/brain local` switches to it (`/brain on-device` goes back); the model menu beside the input does the same and lists the server's models.
+- The server is found on the usual local ports (11434, 8080, 1234), or set it with `/brain server <url>`. Choose the model with `/brain model <name>`. With none chosen, the portal picks `gemma4:e4b` if the server has it, or the `qwen3.6` coding model on a Mac with 64 GB or more (the two that passed every test below); `/brain model auto` returns to that.
+- The portal assumes a 32,768-token window (`/brain context <tokens>` to change it). With that much room the router is skipped: the model gets every tool with its full schema and runs up to 16 rounds of tool calls per request. Make sure your server really loads the model with a window that large; some default to far less and cut the prompt silently.
+- The confirmation prompts for publishing and deleting, and the local-first rule for pictures, apply to every model alike (`LocalBrain.swift`).
+
+How well this works depends on the model's tool calling, and bigger is not reliably better. Measured under Ollama on six tasks (a lookup, reading a scene, a multi-step build, a search with no result, a three-turn edit, a refused delete), one run each:
+
+| Model | Size | Passed | Typical seconds per request |
+|---|---|---|---|
+| qwen3.6 35b-a3b coding | 21 GB | 6 of 6 | 9 |
+| gemma4 e4b (QAT) | 6 GB | 6 of 6 | 11 |
+| gemma4 8B | 10 GB | 5 of 6 | 12 |
+| qwen3.8 27b | 31 GB | 5 of 6 | 25 |
+| gemma4 31b | 20 GB | 5 of 6 | 64 |
+| nemotron-3.5-lightning 30b | 22 GB | 4 of 6 | 13 |
+| qwen3.5 9b | 7 GB | about 1 | 18 |
+| lfm2.5-thinking 1.2b | 1 GB | 0 | 11 |
+
+Models without tool support (gemma3, for one) cannot be used at all.
+
 ## Images and the Local shelf
 
 Pictures stay on the Mac until the user uploads one. The Local shelf is a plain folder, `~/Pictures/TWP Portal` (override with `TWP_PORTAL_SHELF`), shown in the app's **Local** tab; `shelf.json` beside the files remembers prompts and which files were uploaded where. Files can be added or removed in Finder.

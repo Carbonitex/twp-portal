@@ -26,11 +26,18 @@ final class PortalModel: ObservableObject {
   @Published var account: Account?
   @Published var scenes: [SceneSummary] = []
   @Published var sceneFilter = ""
+  @Published var folders: [SceneFolder] = []
+  /// Folders opened in the sidebar. Remembered between launches.
+  @Published var openFolders: Set<String> = Set(UserDefaults.standard.stringArray(forKey: "openFolders") ?? []) {
+    didSet { UserDefaults.standard.set(Array(openFolders), forKey: "openFolders") }
+  }
   @Published var focus: SceneSummary?
   @Published var preview: NSImage?
   @Published var previewLoading = false
   @Published var previewError: String?
   @Published var brain: Brain = .onDevice
+  /// The local model server's state, refreshed at launch and after /brain commands.
+  @Published var localBrain = LocalBrain.lastStatus
   @Published var dropTargeted = false
   @Published var sidebarTab: SidebarTab = .scenes
   /// The lightbulb: show the suggestion library even mid-conversation.
@@ -235,9 +242,11 @@ final class PortalModel: ObservableObject {
     entries = [Entry(kind: .info, text: "TWP Portal · \(environment.displayName) (\(environment.origin.host ?? "")). Type what you want, or /help.")]
     account = nil
     scenes = []
+    folders = []
     focus = nil
     preview = nil
     Task {
+      localBrain = await LocalBrain.check()
       await refreshAccount()
       await runStartupScript()
     }
@@ -275,6 +284,8 @@ final class PortalModel: ObservableObject {
     do {
       account = try await portal.account()
       scenes = try await portal.scenes()
+      // Folders are a nicety: if the scene map cannot be read, the list simply shows flat.
+      folders = (try? await portal.folders()) ?? folders
       if starterScene == nil || !scenes.contains(where: { $0.id == starterScene?.id }) { starterScene = scenes.first { $0.objectCount > 0 } ?? scenes.first }
     } catch PortalError.notSignedIn {
       signedIn = false
@@ -291,6 +302,42 @@ final class PortalModel: ObservableObject {
 
   /// Suggestions show while nothing has been asked yet, or when asked for with the lightbulb.
   var startersVisible: Bool { startersRequested || !entries.contains { $0.kind == .user } }
+
+  // MARK: Folders
+
+  /// Folders whose parent is `parent` (nil = top level), by name. A folder whose parent is unknown shows at the top.
+  func childFolders(of parent: String?) -> [SceneFolder] {
+    let known = Set(folders.map(\.id))
+    return folders.filter { folder in
+      let effective = folder.parentId.flatMap { known.contains($0) ? $0 : nil }
+      return effective == parent
+    }
+    .sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+  }
+
+  /// Scenes filed directly in `folder` (nil = top level, including scenes whose folder is unknown).
+  func scenes(in folder: String?) -> [SceneSummary] {
+    let known = Set(folders.map(\.id))
+    return scenes.filter { scene in scene.folderId.flatMap { known.contains($0) ? $0 : nil } == folder }
+  }
+
+  /// Every scene inside a folder, subfolders included.
+  func sceneCount(inside folder: String) -> Int {
+    scenes(in: folder).count + childFolders(of: folder).reduce(0) { $0 + sceneCount(inside: $1.id) }
+  }
+
+  func folderName(_ id: String?) -> String? { id.flatMap { id in folders.first { $0.id == id }?.name } }
+
+  /// Opens every folder on the way to a scene, so a scene the agent just worked on is visible.
+  private func reveal(_ scene: SceneSummary) {
+    var next = scene.folderId
+    var hops = 0
+    while let id = next, hops < 32 {
+      openFolders.insert(id)
+      next = folders.first { $0.id == id }?.parentId
+      hops += 1
+    }
+  }
 
   var visibleScenes: [SceneSummary] {
     sceneFilter.isEmpty ? scenes : scenes.filter { $0.name.localizedCaseInsensitiveContains(sceneFilter) || $0.id.contains(sceneFilter) }
@@ -320,6 +367,10 @@ final class PortalModel: ObservableObject {
       await portal.handle(line)
       linking = false
       progressText = nil
+      if line.hasPrefix("/brain") {
+        brain = portal.agent.brain
+        localBrain = LocalBrain.lastStatus
+      }
       if line.hasPrefix("/pictures") { syncPictureSettings() } else if pictureEngine.isQwen { pollPictures() }
       // Let queued events land before the prompt comes back.
       await withCheckedContinuation { c in DispatchQueue.main.async { c.resume() } }
@@ -382,6 +433,7 @@ final class PortalModel: ObservableObject {
     defer { Task { await refreshPreview() } }
     if !scenes.contains(where: { $0.id == id }) { scenes = (try? await portal.scenes()) ?? scenes }
     if let scene = scenes.first(where: { $0.id == id }) {
+      reveal(scene)
       focus = scene
       portal.agent.focusScene = (scene.id, scene.name)
       preview = nil

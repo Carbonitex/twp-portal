@@ -13,6 +13,11 @@ public struct PortalConfig: Codable {
   public var picturesControl: String?
   /// Unload the Qwen model after this many idle minutes; nil leaves it to the server.
   public var picturesAutoOff: Int?
+  /// The `local` brain: an OpenAI-compatible server address (nil tries the usual local ports),
+  /// the model to ask for, and its context window in tokens (nil means 32,768).
+  public var brainServer: String?
+  public var brainModel: String?
+  public var brainContext: Int?
 
   private static var url: URL { PortalPaths.supportDirectory.appendingPathComponent("config.json") }
   public static func load() -> PortalConfig {
@@ -28,6 +33,15 @@ public struct SceneSummary: Identifiable, Sendable, Hashable {
   public let isPublic: Bool
   public let objectCount: Int
   public let url: String
+  /// The folder the scene is filed in; nil at the top level.
+  public var folderId: String?
+}
+
+public struct SceneFolder: Identifiable, Sendable, Hashable {
+  public let id: String
+  public let name: String
+  /// nil for a top-level folder.
+  public let parentId: String?
 }
 
 public struct Account: Sendable {
@@ -81,7 +95,8 @@ public final class Portal: @unchecked Sendable {
       /discard <name>   move a Local picture to the Trash
       /tools            every tool the server offers
       /call <tool> <json>                     run one tool directly
-      /brain [on-device|private-cloud]        which Apple model answers
+      /brain [on-device|private-cloud|local]  which model answers; local is your own model server
+                                              (Ollama, llama-server, LM Studio): /brain server <url>, /brain model <name>
       /clear            forget the conversation so far
     """
 
@@ -101,7 +116,16 @@ public final class Portal: @unchecked Sendable {
       guard let id = s["id"]?.stringValue else { return nil }
       return SceneSummary(
         id: id, name: s["name"]?.stringValue ?? "(unnamed)", published: s["published"]?.boolValue ?? false,
-        isPublic: s["public"]?.boolValue ?? false, objectCount: s["objectCount"]?.intValue ?? 0, url: s["url"]?.stringValue ?? "")
+        isPublic: s["public"]?.boolValue ?? false, objectCount: s["objectCount"]?.intValue ?? 0, url: s["url"]?.stringValue ?? "",
+        folderId: s["folderId"]?.stringValue)
+    }
+  }
+
+  /// The user's scene folders (they nest through `parentId`), from the scene map.
+  public func folders() async throws -> [SceneFolder] {
+    (try await callJSON("get_scene_map")["folders"]?.arrayValue ?? []).compactMap { f in
+      guard let id = f["id"]?.stringValue else { return nil }
+      return SceneFolder(id: id, name: f["name"]?.stringValue ?? "(unnamed folder)", parentId: f["parentId"]?.stringValue)
     }
   }
 
@@ -128,9 +152,14 @@ public final class Portal: @unchecked Sendable {
         try await command(line)
       } else {
         guard await auth.isSignedIn else { throw PortalError.notSignedIn }
-        let status = PortalAgent.availability(agent.brain)
-        guard status.ok else {
-          throw PortalError.tool("Apple's \(agent.brain.rawValue) model can't answer right now: \(status.detail). Slash commands still work (/help).")
+        if agent.brain == .local {
+          let status = await LocalBrain.check()
+          guard status.ok else { throw PortalError.tool("The local model can't answer right now: \(status.detail). Slash commands still work (/help), and /brain on-device goes back to Apple's.") }
+        } else {
+          let status = PortalAgent.availability(agent.brain)
+          guard status.ok else {
+            throw PortalError.tool("Apple's \(agent.brain.rawValue) model can't answer right now: \(status.detail). Slash commands still work (/help).")
+          }
         }
         emit(.assistant(try await agent.respond(to: line)))
       }
@@ -302,23 +331,50 @@ public final class Portal: @unchecked Sendable {
       guard let tool = bits.first else { throw PortalError.tool("Usage: /call <tool> {json arguments}") }
       let args = bits.count > 1 ? try JSONValue.parse(bits[1]) : [:]
       // Direct calls skip the model, not the safety prompt.
-      if let question = PortalAgent.confirmation(for: tool)?(args), await !agent.confirm(question) {
-        emit(.info("Cancelled."))
-        return
+      switch await PortalAgent.confirmation(for: tool, mcp: mcp)?(args) ?? .proceed {
+      case .proceed: break
+      case .reject(let reason): throw PortalError.tool(reason)
+      case .ask(let question):
+        if await !agent.confirm(question) {
+          emit(.info("Cancelled."))
+          return
+        }
       }
       let result = try await mcp.call(tool, args)
       for image in result.images { emit(.image(image.data, caption: tool)) }
       if result.isError { emit(.error(result.text)) } else if !result.text.isEmpty { emit(.json(result.json?.serialized(pretty: true) ?? result.text)) }
     case "brain":
-      if let brain = Brain(rawValue: rest.lowercased()) {
+      let words = rest.split(separator: " ").map(String.init)
+      var config = PortalConfig.load()
+      switch words.first?.lowercased() {
+      case nil: break
+      case "server":
+        if words.count > 1, words[1].lowercased() != "auto" {
+          guard LocalBrain.normalised(words[1]) != nil else { throw PortalError.tool("Give an address such as http://127.0.0.1:11434 (Ollama), :8080 (llama-server) or :1234 (LM Studio).") }
+          config.brainServer = words[1]
+        } else {
+          config.brainServer = nil
+        }
+        config.save()
+      case "model":
+        config.brainModel = words.count > 1 && words[1].lowercased() != "auto" ? words[1...].joined(separator: " ") : nil
+        config.save()
+      case "context":
+        guard words.count > 1, let size = Int(words[1]), size >= 4096 else { throw PortalError.tool("Usage: /brain context <tokens>, at least 4096 (the default is \(LocalBrain.defaultContext)).") }
+        config.brainContext = size
+        config.save()
+      case let word?:
+        guard let brain = Brain(rawValue: word) else { throw PortalError.tool("Choose on-device, private-cloud or local. For local also: /brain server <url>, /brain model <name>, /brain context <tokens>.") }
         agent.brain = brain
-        var config = PortalConfig.load()
         config.brain = brain.rawValue
         config.save()
-      } else if !rest.isEmpty {
-        throw PortalError.tool("Choose on-device or private-cloud.")
       }
-      let lines = Brain.allCases.map { b in "\(b == agent.brain ? "●" : "○") \(b.rawValue.rightPad(14)) \(PortalAgent.availability(b).detail)" }
+      let local = await LocalBrain.check()
+      var lines = Brain.allCases.map { b in "\(b == agent.brain ? "●" : "○") \(b.rawValue.rightPad(14)) \(PortalAgent.availability(b).detail)" }
+      if agent.brain == .local || words.first.map({ ["server", "model", "context", "local"].contains($0.lowercased()) }) ?? false {
+        if !local.models.isEmpty { lines.append("models on \(local.address ?? "?"): " + local.models.joined(separator: ", ")) }
+        lines.append("local context window: \(LocalBrain.contextSize) tokens (/brain context <tokens> if your server is set up differently)")
+      }
       emit(.info(lines.joined(separator: "\n")))
     case "clear":
       agent.reset()
