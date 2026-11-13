@@ -95,6 +95,8 @@ struct Sidebar: View {
           Text("Not linked").font(.headline)
           Text("Link this Mac to your thinkwith.pictures account. You approve it on the website; no password is typed here.")
             .font(.caption).foregroundStyle(.secondary)
+          Text("New to thinkwith.pictures? Linking also creates your free account.")
+            .font(.caption).foregroundStyle(.secondary)
           // Plain styling on purpose: with .fixedSize on the text above and a
           // .borderedProminent button here, the whole window rendered blank
           // while unlinked (macOS 27.2). Check the unlinked state after restyling.
@@ -273,9 +275,15 @@ struct Terminal: View {
               .id("starters")
             }
             if model.busy {
-              HStack(spacing: 8) {
+              HStack(spacing: 10) {
                 ProgressView().controlSize(.small)
-                Text("Working…").foregroundStyle(Palette.dim)
+                if model.linking {
+                  Text("Waiting for you in the browser…").foregroundStyle(Palette.dim)
+                  Button("Open the page again") { model.reopenLinkPage() }.controlSize(.small)
+                  Button("Cancel") { model.cancelLinking() }.controlSize(.small)
+                } else {
+                  Text("Working…").foregroundStyle(Palette.dim)
+                }
               }
               .id("busy")
             }

@@ -133,10 +133,15 @@ public final class Portal: @unchecked Sendable {
     switch name {
     case "help", "?": emit(.info(Self.help))
     case "login":
-      emit(.info("Opening \(environment.originString) in your browser. Approve there to link this Mac."))
+      emit(.info("""
+        Opening \(environment.origin.host ?? environment.originString) in your browser.
+          1. Sign in there with Discord or Google. No account yet? That creates one for you, free.
+          2. Press Approve to link this Mac.
+        Take your time. This window waits for you.
+        """))
       try await auth.signIn()
       let me = try await account()
-      emit(.info("Linked to \(environment.displayName) as \(me.nickname)."))
+      emit(.info("Linked. Welcome, \(me.nickname)! Your scenes are in the sidebar; the suggestions below are a good place to start."))
     case "logout":
       await auth.signOut()
       agent.reset()

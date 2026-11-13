@@ -20,6 +20,8 @@ final class PortalModel: ObservableObject {
   @Published var entries: [Entry] = []
   @Published var input = ""
   @Published var busy = false
+  /// True while /login is waiting on the browser, so the UI can offer "open again" and "cancel".
+  @Published var linking = false
   @Published var signedIn = false
   @Published var account: Account?
   @Published var scenes: [SceneSummary] = []
@@ -191,10 +193,12 @@ final class PortalModel: ObservableObject {
     entries.append(Entry(kind: .user, text: line))
     startersRequested = false
     busy = true
+    linking = line.trimmingCharacters(in: .whitespaces) == "/login"
     // Commands that put a picture on the shelf bring the shelf into view.
     if ["/imagine", "/cutout", "/import", "/local"].contains(line.split(separator: " ").first.map(String.init) ?? "") { sidebarTab = .local }
     Task {
       await portal.handle(line)
+      linking = false
       // Let queued events land before the prompt comes back.
       await withCheckedContinuation { c in DispatchQueue.main.async { c.resume() } }
       busy = false
@@ -203,6 +207,9 @@ final class PortalModel: ObservableObject {
       if !line.hasPrefix("/") || word == "/call", focus != nil { await refreshPreview() }
     }
   }
+
+  func cancelLinking() { Task { await portal.auth.cancelSignIn() } }
+  func reopenLinkPage() { Task { await portal.auth.reopenSignInPage() } }
 
   func recall(_ direction: Int) {
     guard !history.isEmpty else { return }

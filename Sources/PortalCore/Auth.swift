@@ -56,6 +56,7 @@ public struct PortalEnvironment: Hashable, Sendable, Codable {
 public enum PortalError: LocalizedError {
   case notSignedIn
   case signInFailed(String)
+  case signInCancelled
   case http(Int, String)
   case protocolError(String)
   case tool(String)
@@ -65,6 +66,7 @@ public enum PortalError: LocalizedError {
     switch self {
     case .notSignedIn: return "Not signed in. Run /login."
     case .signInFailed(let m): return "Sign-in failed: \(m)"
+    case .signInCancelled: return "Linking cancelled. Nothing was linked."
     case .http(let code, let m): return "HTTP \(code): \(m)"
     case .protocolError(let m): return m
     case .tool(let m): return m
@@ -291,9 +293,17 @@ public actor PortalAuth {
     ]
     let url = c.url!
     onURL?(url)
+    activeReceiver = listener
+    pendingSignInURL = url
+    defer {
+      activeReceiver = nil
+      pendingSignInURL = nil
+    }
     await MainActor.run { _ = NSWorkspace.shared.open(url) }
 
-    let query = try await listener.waitForCallback(timeout: 300)
+    // Generous on purpose: a newcomer may be creating a Discord or Google
+    // login, and their TWP account, before they ever reach Approve.
+    let query = try await listener.waitForCallback(timeout: 900)
     if let err = query["error"] {
       throw PortalError.signInFailed(err == "access_denied" ? "you cancelled on the consent page" : (query["error_description"] ?? err))
     }
@@ -303,6 +313,21 @@ public actor PortalAuth {
       "grant_type": "authorization_code", "code": code, "client_id": clientId, "redirect_uri": redirect, "code_verifier": verifier,
     ])
     try GrantStore.save(try grant(from: json, clientId: clientId, fallbackRefresh: "", fallbackScope: scopes.joined(separator: " ")), environment)
+  }
+
+  private var activeReceiver: LoopbackReceiver?
+  /// The consent page of a sign-in that is waiting on the browser, if any.
+  public private(set) var pendingSignInURL: URL?
+
+  /// Stops waiting for the browser. The pending `signIn` throws `signInCancelled`.
+  public func cancelSignIn() {
+    activeReceiver?.cancel()
+  }
+
+  /// Opens the consent page again, for someone who closed the tab.
+  public func reopenSignInPage() async {
+    guard let url = pendingSignInURL else { return }
+    await MainActor.run { _ = NSWorkspace.shared.open(url) }
   }
 
   public func signOut() async {
@@ -416,13 +441,17 @@ final class LoopbackReceiver: @unchecked Sendable {
   func waitForCallback(timeout: TimeInterval) async throws -> [String: String] {
     defer { listener.cancel() }
     queue.asyncAfter(deadline: .now() + timeout) { [weak self] in
-      self?.finish(.failure(PortalError.signInFailed("timed out waiting for the browser")))
+      self?.finish(.failure(PortalError.signInFailed("no answer from the browser after 15 minutes. Choose Link Account to try again")))
     }
     return try await withCheckedThrowingContinuation { cont in
       queue.async {
         if let done = self.pending { cont.resume(with: done) } else { self.continuation = cont }
       }
     }
+  }
+
+  func cancel() {
+    queue.async { self.finish(.failure(PortalError.signInCancelled)) }
   }
 
   private func finish(_ result: Result<[String: String], Error>) {
