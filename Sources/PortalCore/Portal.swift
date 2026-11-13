@@ -121,6 +121,17 @@ public final class Portal: @unchecked Sendable {
     }
   }
 
+  /// One scene by id, including a scene someone else owns that this account may view (it is not in `scenes()`).
+  public func sceneSummary(id: String) async throws -> SceneSummary {
+    let s = try await callJSON("get_scene", ["sceneId": .string(id)])
+    let published = s["settings"]?["published"]?.boolValue ?? false
+    return SceneSummary(
+      id: id, name: s["name"]?.stringValue ?? "scene \(id)", published: published,
+      // A scene that is not ours and that we can still read is one its owner has opened to visitors.
+      isPublic: s["settings"]?["public"]?.boolValue ?? (published && s["role"]?.stringValue != "owner"),
+      objectCount: s["objects"]?.arrayValue?.count ?? 0, url: s["url"]?.stringValue ?? "", folderId: nil)
+  }
+
   /// The user's scene folders (they nest through `parentId`), from the scene map.
   public func folders() async throws -> [SceneFolder] {
     (try await callJSON("get_scene_map")["folders"]?.arrayValue ?? []).compactMap { f in

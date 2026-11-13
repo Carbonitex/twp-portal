@@ -440,7 +440,9 @@ struct EntryRow: View {
     case .user:
       Text("› \(entry.text)").foregroundStyle(Palette.user).textSelection(.enabled).padding(.top, 6)
     case .assistant:
-      Text(entry.text).foregroundStyle(Palette.text).font(.system(size: 13.5)).textSelection(.enabled).lineSpacing(2)
+      // Models answer in light Markdown; show bold and code as such, keeping their line breaks.
+      Text((try? AttributedString(markdown: entry.text, options: .init(interpretedSyntax: .inlineOnlyPreservingWhitespace))) ?? AttributedString(entry.text))
+        .foregroundStyle(Palette.text).font(.system(size: 13.5)).textSelection(.enabled).lineSpacing(2)
     case .info:
       Text(entry.text).foregroundStyle(Palette.text.opacity(0.85)).textSelection(.enabled)
     case .error:

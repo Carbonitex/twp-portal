@@ -437,6 +437,11 @@ final class PortalModel: ObservableObject {
       focus = scene
       portal.agent.focusScene = (scene.id, scene.name)
       preview = nil
+    } else if let scene = try? await portal.sceneSummary(id: id) {
+      // Someone else's scene that this account may view: not in the list, but it still gets the preview panel.
+      focus = scene
+      portal.agent.focusScene = (scene.id, scene.name)
+      preview = nil
     }
   }
 

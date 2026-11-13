@@ -515,6 +515,8 @@ public final class PortalAgent: @unchecked Sendable {
 
   public func respond(to request: String) async throws -> String {
     let all = try await allTools()
+    // The first scene a request looks at takes the focus ("what is in Harbour?"); later reads leave it there.
+    focusSettled.value = false
     let window = await contextSize()
     let small = window < 16000
     let toolBudget = Int(Double(window) * 0.42)
@@ -570,6 +572,7 @@ public final class PortalAgent: @unchecked Sendable {
       If a search finds nothing, stop and tell the user; offer to draw the picture instead. Never place an object without an assetKey or itemId.
       Scenes start as private drafts. Do not publish unless the user asks.
       In whoami, strain.current is the strain the user has LEFT to spend (their balance), out of strain.max.
+      Answer in plain sentences or a short list, never a table.
       When finished, say what changed in one or two plain sentences. If a tool returns ERROR, explain it simply.
       """
 
@@ -580,7 +583,7 @@ public final class PortalAgent: @unchecked Sendable {
         await BridgedTool.execute(
           tool, args, outputLimit: 6000, emit: emit, confirm: confirm,
           remember: { name, text in self?.note(name, text) },
-          touched: { id, name in self?.touch(id, name) })
+          touched: { id, name in self?.touch(id, name, read: Self.isRead(tool.name)) })
       }
       return finish(request, reply)
     }
@@ -615,7 +618,7 @@ public final class PortalAgent: @unchecked Sendable {
         tool: tool, bridge: bridge, parameters: try bridge.generationSchema(toolName: tool.name, inputSchema: tool.inputSchema),
         outputLimit: small ? 1400 : 6000, emit: emit, confirm: confirm,
         remember: { [weak self] name, text in self?.note(name, text) },
-        touched: { [weak self] id, name in self?.touch(id, name) })
+        touched: { [weak self] id, name in self?.touch(id, name, read: Self.isRead(tool.name)) })
     }
     var options = GenerationOptions()
     options.temperature = 0.2
@@ -624,7 +627,16 @@ public final class PortalAgent: @unchecked Sendable {
   }
 
   /// A successful call worked on this scene, so it becomes "this scene".
-  private func touch(_ id: String, _ name: String?) {
+  private static func isRead(_ tool: String) -> Bool { tool.hasPrefix("get_") || tool.hasPrefix("list_") || tool == "render_scene_preview" }
+  /// Set once a tool call in the current request has settled which scene is in focus.
+  private let focusSettled = Flag()
+
+  /// A successful call worked on this scene, so it becomes "this scene". Changing a scene always moves
+  /// the focus there. Looking at one moves it only if nothing else has yet in this request, so a model
+  /// that reads several linked scenes to answer a question does not drag the focus along with it.
+  private func touch(_ id: String, _ name: String?, read: Bool) {
+    if read, focusSettled.value { return }
+    focusSettled.value = true
     let known = focusScene?.id == id ? focusScene?.name : nil
     focusScene = (id, name ?? known ?? "scene \(id)")
     onFocusChange?(id)

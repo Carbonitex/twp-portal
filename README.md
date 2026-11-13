@@ -4,6 +4,16 @@ A native macOS companion for [thinkwith.pictures](https://thinkwith.pictures): l
 
 > **Needs macOS 27 on Apple silicon with Apple Intelligence turned on.** This first release is source only: build it yourself with the two commands under [Build and run](#build-and-run). Signed, ready-to-run downloads will come soon.
 
+![TWP Portal with the scene folders on the left, a question about Hearthstone Square answered in the middle, and the scene's live preview on the right](docs/screenshots/scenes.png)
+
+*Your scenes and folders on the left, the conversation in the middle, a live preview of the scene in focus on the right. Here a local model (the optional `/brain local`) reads the public scene Hearthstone Square and its neighbours to answer a question.*
+
+| Draw and edit pictures on your Mac | Progress, with a Stop button |
+|---|---|
+| ![A drawn windmill sticker and a harbour picture repainted as a night scene, both saved to the Local shelf](docs/screenshots/pictures.png) | ![An edit in progress showing step 4 of 8 and a Stop button](docs/screenshots/rendering.png) |
+
+*Pictures stay on the Local shelf (left) until you upload one. These two were made with the optional Qwen-Image engine; Apple's Image Playground is the default.*
+
 It is a client of the site's Scene Builder MCP endpoint (`/api/twp/mcp`), the same one any MCP-capable assistant can connect to; see <https://thinkwith.pictures/agents>. Everything it does is done as the signed-in user and spends their strain exactly as the website would.
 
 ## What is in here
