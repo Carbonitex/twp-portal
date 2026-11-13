@@ -18,23 +18,21 @@ public struct PortalEnvironment: Hashable, Sendable, Codable {
   }
 
   public static let production = PortalEnvironment(name: "prod", origin: URL(string: "https://thinkwith.pictures")!)
-  public static let local = PortalEnvironment(name: "local", origin: URL(string: "http://localhost:8798")!)
-  public static let builtIn: [PortalEnvironment] = [.production, .local]
-  /// What users get: production only, shown as "Online". Local (a developer's
-  /// own server on localhost) and any other origin are reachable with
-  /// `twp --env <name or https origin>` / `twp use <…>` and never offered to users.
+  public static let builtIn: [PortalEnvironment] = [.production]
+  /// What users get: production only, shown as "Online". A developer running
+  /// their own server can point the portal at it with
+  /// `twp --env <http(s) origin>` / `twp use <origin>`; it is never offered to users.
   public static let userFacing: [PortalEnvironment] = [.production]
 
   /// The name people see. Production is simply "Online".
   public var displayName: String {
     switch name {
     case "prod": return "Online"
-    case "local": return "Local dev"
     default: return name
     }
   }
 
-  /// "prod" / "local", or any origin such as https://example.com.
+  /// "prod", or any origin such as https://example.com or http://localhost:8798.
   public static func named(_ text: String) -> PortalEnvironment? {
     if let hit = builtIn.first(where: { $0.name == text.lowercased() }) { return hit }
     if text.lowercased() == "production" { return .production }
@@ -45,6 +43,9 @@ public struct PortalEnvironment: Hashable, Sendable, Codable {
     c.port = url.port
     return c.url.map { PortalEnvironment(name: host, origin: $0) }
   }
+
+  /// What is written to the config file so the choice survives a relaunch.
+  public var configKey: String { self == .production ? "prod" : originString }
 
   public var mcpEndpoint: URL { origin.appendingPathComponent("api/twp/mcp") }
   var originString: String { origin.absoluteString.hasSuffix("/") ? String(origin.absoluteString.dropLast()) : origin.absoluteString }

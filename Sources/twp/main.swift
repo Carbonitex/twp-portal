@@ -5,8 +5,8 @@ import PortalCore
 //   twp                     interactive prompt
 //   twp login | logout | whoami | scenes | tools | ...   (any slash command, without the slash)
 //   twp ask "make a scene called Harbour"                 one request to the agent
-//   twp --env local ...     pick a server for this run (prod | local | an https origin)
-//   twp use local           remember a server
+//   twp --env <origin> ...  use another server for this run (e.g. http://localhost:8798)
+//   twp use <origin>        remember a server (twp use prod to go back)
 
 var args = Array(CommandLine.arguments.dropFirst())
 var config = PortalConfig.load()
@@ -17,7 +17,7 @@ if let i = args.firstIndex(of: "--env"), i + 1 < args.count {
 }
 if args.first == "use", args.count > 1 {
   guard PortalEnvironment.named(args[1]) != nil else {
-    print("Unknown environment \"\(args[1])\". Use prod, local or an https origin.")
+    print("Unknown environment \"\(args[1])\". Use prod or a server origin such as http://localhost:8798.")
     exit(2)
   }
   config.environment = args[1]
@@ -77,7 +77,7 @@ if let first = args.first {
   case "ask":
     await portal.handle(args.dropFirst().joined(separator: " "))
   case "help", "--help", "-h":
-    print("twp [--env prod|local|<https origin>] [command]\n  twp use <env>     remember an environment\n  twp ask <words>   one request in plain words\n  twp               interactive prompt\n\n" + Portal.help)
+    print("twp [--env prod|<server origin>] [command]\n  twp use <env>     remember an environment\n  twp ask <words>   one request in plain words\n  twp               interactive prompt\n\n" + Portal.help)
   default:
     await portal.handle("/" + args.joined(separator: " "))
   }

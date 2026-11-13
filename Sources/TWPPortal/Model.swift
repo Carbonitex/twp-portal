@@ -139,7 +139,7 @@ final class PortalModel: ObservableObject {
     guard env != environment, !busy else { return }
     environment = env
     var config = PortalConfig.load()
-    config.environment = env.name
+    config.environment = env.configKey
     config.save()
     connect()
   }

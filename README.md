@@ -33,7 +33,7 @@ open "dist/TWP Portal.app"
 2. Type what you want: *"make a new scene called Harbour with that background"*, *"add an iron boots sticker in the middle of this scene"*, *"make it twice as big"*.
 3. Or use commands, which never involve a model: `/scenes`, `/scene <id>`, `/preview`, `/upload <file> [sticker|background]`, `/cutout <file>`, `/imagine <text> [--background]`, `/call <tool> <json>`. `/help` lists them all.
 
-Users only ever see production ("Online"), so the app shows no environment picker. Developers can point it elsewhere: `twp --env local …` (a server on `localhost:8798`) or `twp --env https://your.server …` for one run, or `twp use <…>` to make the CLI and the app both use it (the app then shows a picker with Online and that server, so you can switch back).
+Users only ever see production ("Online"), so the app shows no environment picker. A developer running their own server can point the portal at it by origin: `twp --env http://localhost:8798 …` for one run, or `twp use http://localhost:8798` to make the CLI and the app both use it (the app then shows a picker with Online and that server; `twp use prod` goes back).
 
 While nothing has been asked yet, the chat area shows a library of suggestion cards (`Starters.swift`), built from the user's own scene names, the focused scene and the Local shelf. Cards marked with a return arrow only look things up and run on click; cards marked with a pencil change the account or spend strain, so they are placed in the input to edit and confirm. The lightbulb beside the input brings the library back at any time, and typing `/` lists the matching commands above the input.
 
