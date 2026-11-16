@@ -5,17 +5,20 @@ import Foundation
 /// What draws pictures. Apple's Image Playground is the default and needs
 /// nothing installed. The Qwen engines are optional: they call a localgen
 /// server (Qwen-Image 2.1) running on this Mac or the local network, and add
-/// editing and filling, which Image Playground cannot do.
+/// editing and filling, which Image Playground cannot do. `openrouter` is also
+/// optional: a hosted picture model through the user's OpenRouter key.
 public enum PictureEngine: String, Sendable, CaseIterable {
   case apple
   case qwenTurbo = "qwen-turbo"
   case qwen
+  case openrouter
 
   public var label: String {
     switch self {
     case .apple: return "Apple Image Playground"
     case .qwenTurbo: return "Qwen-Image 2.1 Turbo"
     case .qwen: return "Qwen-Image 2.1"
+    case .openrouter: return "OpenRouter (\(OpenRouter.imageModel))"
     }
   }
   public var shortLabel: String {
@@ -23,6 +26,7 @@ public enum PictureEngine: String, Sendable, CaseIterable {
     case .apple: return "Apple"
     case .qwenTurbo: return "Qwen Turbo"
     case .qwen: return "Qwen 2.1"
+    case .openrouter: return "OpenRouter"
     }
   }
   public var detail: String {
@@ -30,9 +34,13 @@ public enum PictureEngine: String, Sendable, CaseIterable {
     case .apple: return "built in; one picture at a time, no editing"
     case .qwenTurbo: return "local server, about a minute a picture; edit and fill"
     case .qwen: return "local server, best quality, several minutes a picture; edit and fill"
+    case .openrouter: return "hosted, paid per picture on your OpenRouter key; pictures leave this Mac; edit and fill"
     }
   }
-  public var isQwen: Bool { self != .apple }
+  /// The optional localgen server engines (status light, unloading).
+  public var isQwen: Bool { self == .qwen || self == .qwenTurbo }
+  /// Every engine but Image Playground draws by itself (no sheet) and can edit and fill.
+  public var canEdit: Bool { self != .apple }
   /// The model name the localgen API expects.
   var serverModel: String { self == .qwen ? "base" : "turbo" }
 
@@ -295,7 +303,7 @@ public enum Pictures {
 
   /// New pictures from words. Stickers come back transparent and trimmed.
   public static func draw(_ request: PictureRequest, engine: PictureEngine = .current, progress: (@Sendable (String) -> Void)? = nil) async throws -> [CGImage] {
-    guard engine.isQwen else {
+    guard engine.canEdit else {
       return try await ImagePipeline.generate(prompt: request.prompt, style: request.style, count: request.count)
     }
     let sticker = request.purpose == .sticker
@@ -309,10 +317,16 @@ public enum Pictures {
       try Task.checkCancellation()
       if count > 1 { progress?("picture \(n) of \(count)") }
       do {
-        let image = try await QwenServer.generate(prompt: prompt, engine: engine, width: size.0, height: size.1, alpha: sticker, progress: { text in
-          progress?(count > 1 ? "picture \(n) of \(count) · \(text)" : text)
-        })
-        images.append(sticker ? ImagePipeline.trimTransparent(image) : image)
+        let image: CGImage
+        if engine == .openrouter {
+          progress?(count > 1 ? "picture \(n) of \(count) · waiting for \(OpenRouter.imageModel)" : "waiting for \(OpenRouter.imageModel) on OpenRouter")
+          image = try await OpenRouter.image(prompt: prompt, ratio: Double(size.0) / Double(size.1), transparent: sticker)
+        } else {
+          image = try await QwenServer.generate(prompt: prompt, engine: engine, width: size.0, height: size.1, alpha: sticker, progress: { text in
+            progress?(count > 1 ? "picture \(n) of \(count) · \(text)" : text)
+          })
+        }
+        images.append(sticker ? try transparentSticker(image) : image)
       } catch {
         // Keep what already arrived when a later picture of a batch fails.
         if images.isEmpty { throw error }
@@ -322,10 +336,26 @@ public enum Pictures {
     return images
   }
 
-  private static func requireQwen(_ engine: PictureEngine, _ what: String) throws {
-    guard engine.isQwen else {
-      throw PortalError.image("\(what) needs the Qwen picture engine; Apple's Image Playground only draws new pictures. Turn it on with /pictures qwen-turbo (needs a localgen server).")
+  /// Most hosted models cannot draw transparency, so an opaque sticker gets the same Vision cut-out as /cutout.
+  static func transparentSticker(_ image: CGImage) throws -> CGImage {
+    ImagePipeline.trimTransparent(ImagePipeline.hasTransparency(image) ? image : try ImagePipeline.cutout(image))
+  }
+
+  private static func requireEditing(_ engine: PictureEngine, _ what: String) throws {
+    guard engine.canEdit else {
+      throw PortalError.image("\(what) needs the Qwen or OpenRouter picture engine; Apple's Image Playground only draws new pictures. Turn one on with /pictures qwen-turbo (needs a localgen server) or /pictures openrouter (needs a key).")
     }
+  }
+
+  /// One repaint by whichever engine: `reference` is PNG bytes of a `w`×`h` picture; the answer comes back at that size.
+  private static func repaint(_ prompt: String, reference: Data, w: Int, h: Int, alpha: Bool, engine: PictureEngine, progress: (@Sendable (String) -> Void)?) async throws -> CGImage {
+    guard engine == .openrouter else {
+      return try await QwenServer.generate(prompt: prompt, engine: engine, width: w, height: h, alpha: alpha, images: [reference], progress: progress)
+    }
+    progress?("waiting for \(OpenRouter.imageModel) on OpenRouter")
+    let answer = try await OpenRouter.image(prompt: prompt, ratio: Double(w) / Double(h), transparent: alpha, references: [reference])
+    // The model picks its own size from a few aspect ratios; bring it back to the picture's.
+    return try ImagePipeline.resized(answer, width: w, height: h)
   }
 
   /// A size with the picture's proportions whose longest side is at most `maxSide`.
@@ -336,20 +366,26 @@ public enum Pictures {
 
   /// Changes a whole picture as instructed ("make it night", "turn the roof red").
   public static func edit(_ image: CGImage, instruction: String, engine: PictureEngine = .current, progress: (@Sendable (String) -> Void)? = nil) async throws -> CGImage {
-    try requireQwen(engine, "Editing")
+    try requireEditing(engine, "Editing")
     let alpha = ImagePipeline.hasTransparency(image)
     let (w, h) = workingSize(image)
-    let reference = try ImagePipeline.encode(try ImagePipeline.resized(image, width: w, height: h), purpose: .sticker).data
-    let prompt = "Edit image 1: \(instruction). Keep the composition, the subject and the art style of image 1 unless the instruction says otherwise."
-    let out = try await QwenServer.generate(prompt: prompt, engine: engine, width: w, height: h, alpha: alpha, images: [reference], progress: progress)
-    return out
+    var source = try ImagePipeline.resized(image, width: w, height: h)
+    // Hosted models do not read transparency: a sticker reaches them on black and comes back on a noisy dark
+    // ground the cut-out cannot separate. Send it on white instead; the answer is cut out again below.
+    let onWhite = alpha && engine == .openrouter
+    if onWhite { source = try ImagePipeline.flattened(source) }
+    let reference = try ImagePipeline.encode(source, purpose: .sticker).data
+    let prompt = "Edit image 1: \(instruction). Keep the composition, the subject and the art style of image 1 unless the instruction says otherwise.\(onWhite ? " Keep the plain white background." : "")"
+    let out = try await repaint(prompt, reference: reference, w: w, h: h, alpha: alpha, engine: engine, progress: progress)
+    // A sticker stays a sticker even when the model answers on an opaque background.
+    return alpha && !ImagePipeline.hasTransparency(out) ? try transparentSticker(out) : out
   }
 
   /// Paints `what` into one rectangle of the picture and leaves every pixel outside it untouched.
   /// The rectangle is marked in flat magenta for the model, and the answer is blended back
   /// through a soft-edged mask of the same rectangle.
   public static func fill(_ image: CGImage, area: FillArea, what: String, engine: PictureEngine = .current, progress: (@Sendable (String) -> Void)? = nil) async throws -> CGImage {
-    try requireQwen(engine, "Filling")
+    try requireEditing(engine, "Filling")
     guard !ImagePipeline.hasTransparency(image) else {
       throw PortalError.image("Fill works on pictures without transparency. For a sticker, use /edit instead.")
     }
@@ -360,7 +396,7 @@ public enum Pictures {
     let marked = try ImagePipeline.painted(base, rect: rect, red: 1, green: 0, blue: 1)
     let reference = try ImagePipeline.encode(marked, purpose: .sticker).data
     let prompt = "Edit image 1: replace the solid magenta rectangle with \(what), painted to blend naturally into the surrounding scene in the same art style. No magenta remains. Everything outside that rectangle stays exactly as in image 1."
-    let answer = try await QwenServer.generate(prompt: prompt, engine: engine, width: w, height: h, alpha: false, images: [reference], progress: progress)
+    let answer = try await repaint(prompt, reference: reference, w: w, h: h, alpha: false, engine: engine, progress: progress)
     return try ImagePipeline.blend(try ImagePipeline.resized(answer, width: w, height: h), over: base, inside: rect)
   }
 }

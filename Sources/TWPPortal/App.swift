@@ -268,8 +268,8 @@ struct LocalShelfView: View {
           Button("Trash") { model.run("/discard \(item.name)") }.disabled(model.busy)
         }
         .controlSize(.small)
-        // Repainting needs the optional Qwen engine; Apple's Image Playground only draws new pictures.
-        if model.pictureEngine.isQwen {
+        // Repainting needs the optional Qwen or OpenRouter engine; Apple's Image Playground only draws new pictures.
+        if model.pictureEngine.canEdit {
           HStack(spacing: 6) {
             Button("Edit…") { model.beginEdit(item) }.disabled(model.busy).help("Describe a change; a repainted copy is saved here")
             Button("Fill…") { model.beginFill(item) }.disabled(model.busy || item.hasAlpha)
@@ -295,7 +295,7 @@ struct ShelfActions: View {
     Button("Upload as Background") { model.run("/upload \(item.name) background") }.disabled(!model.signedIn)
     Divider()
     Button("Cut Out Background") { model.run("/cutout \(item.name)") }
-    if model.pictureEngine.isQwen {
+    if model.pictureEngine.canEdit {
       Button("Edit…") { model.beginEdit(item) }
       Button("Fill an Area…") { model.beginFill(item) }.disabled(item.hasAlpha)
     }
@@ -359,7 +359,7 @@ struct Terminal: View {
                   Button("Cancel") { model.cancelLinking() }.controlSize(.small)
                 } else {
                   Text(model.progressText.map { "Working · \($0)" } ?? "Working…").foregroundStyle(Palette.dim)
-                  // Qwen renders and local-model requests report progress, and both stop cleanly when their request is closed.
+                  // Qwen, OpenRouter and local-model requests report progress, and all stop cleanly when their request is closed.
                   if model.progressText != nil { Button("Stop") { model.stop() }.controlSize(.small) }
                 }
               }
@@ -404,11 +404,13 @@ struct Terminal: View {
         .buttonStyle(.plain)
         .help("Suggestions")
         PictureLight()
-        Menu(model.brain == .local ? (model.localBrain.model ?? "local") : model.brain.rawValue) {
+        Menu(brainLabel) {
           ForEach(Brain.allCases, id: \.self) { brain in
             Button("\(model.brain == brain ? "✓ " : "   ")\(brain.rawValue): \(brain == .local ? model.localBrain.detail : PortalAgent.availability(brain).detail)") {
               model.run("/brain \(brain.rawValue)")
             }
+            // Without a key the entry stays visible, greyed, with the hint in its text.
+            .disabled(brain == .openrouter && !model.openrouterReady)
           }
           // The user's own model server: pick which of its models answers.
           if model.brain == .local, model.localBrain.models.count > 1 {
@@ -422,7 +424,7 @@ struct Terminal: View {
         }
         .disabled(model.busy)
         .menuStyle(.borderlessButton).fixedSize().foregroundStyle(Palette.dim)
-        .help("Which model answers plain-language requests: Apple's, or your own local model server")
+        .help("Which model answers plain-language requests: Apple's, your own local model server, or OpenRouter on your key")
       }
       .padding(.horizontal, 14).padding(.vertical, 11)
       .background(Palette.panel)
@@ -544,6 +546,17 @@ struct Inspector: View {
   }
 }
 
+extension Terminal {
+  /// The brain menu's title: the model's name for a local server or OpenRouter, without the vendor prefix.
+  var brainLabel: String {
+    switch model.brain {
+    case .local: return model.localBrain.model ?? "local"
+    case .openrouter: return OpenRouter.textModel.split(separator: "/").last.map(String.init) ?? "openrouter"
+    default: return model.brain.rawValue
+    }
+  }
+}
+
 // MARK: - Picture engine light
 
 /// A small light by the input: grey for Apple's engine; for the optional Qwen
@@ -570,6 +583,7 @@ struct PictureLight: View {
     }
   }
   private var statusLine: String {
+    if model.pictureEngine == .openrouter { return "Pictures are drawn by \(OpenRouter.imageModel) on OpenRouter (they leave this Mac)" }
     guard model.pictureEngine.isQwen else { return "Pictures are drawn with Apple's Image Playground" }
     return model.qwenStatus?.summary ?? "Checking the Qwen server…"
   }
@@ -589,7 +603,20 @@ struct PictureLight: View {
       }
       Divider()
       ForEach(PictureEngine.allCases, id: \.self) { engine in
-        Button("\(model.pictureEngine == engine ? "✓ " : "   ")\(engine.label)") { model.setPictureEngine(engine) }.disabled(model.busy)
+        let locked = engine == .openrouter && !model.openrouterReady
+        Button("\(model.pictureEngine == engine ? "✓ " : "   ")\(engine.label)\(locked ? ": set a key with /openrouter key <key>" : "")") { model.setPictureEngine(engine) }
+          .disabled(model.busy || locked)
+      }
+      if model.pictureEngine == .openrouter {
+        Divider()
+        Text("OpenRouter picture model")
+        ForEach(OpenRouter.namedImageModels, id: \.id) { named in
+          Button("\(model.openrouterImageModel == named.id ? "✓ " : "   ")\(named.note)") { model.run("/pictures model \(named.name)") }
+            .disabled(model.busy)
+        }
+        if !OpenRouter.namedImageModels.contains(where: { $0.id == model.openrouterImageModel }) {
+          Text("✓ \(model.openrouterImageModel) (set with /pictures model)")
+        }
       }
     } label: {
       HStack(spacing: 5) {

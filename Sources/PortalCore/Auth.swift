@@ -215,10 +215,72 @@ enum GrantStore {
   }
 }
 
+/// Other secrets (an OpenRouter key), stored by the same rule as the grant:
+/// a 0600 file in Application Support for ad-hoc builds, the login Keychain
+/// for builds with a stable signing identity. Never in config.json.
+enum SecretStore {
+  private static let lock = NSLock()
+  nonisolated(unsafe) private static var cache: [String: String?] = [:]
+
+  static func read(_ name: String) -> String? {
+    lock.lock()
+    defer { lock.unlock() }
+    if let hit = cache[name] { return hit }
+    let data = GrantStore.useFile ? try? Data(contentsOf: fileURL(name)) : keychainRead(name)
+    let value = data.map { String(decoding: $0, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines) }.flatMap { $0.isEmpty ? nil : $0 }
+    cache[name] = .some(value)
+    return value
+  }
+
+  static func write(_ name: String, _ value: String) throws {
+    let data = Data(value.utf8)
+    if GrantStore.useFile {
+      let url = fileURL(name)
+      // Create it 0600 before the secret is written, so it is never readable by others even briefly.
+      FileManager.default.createFile(atPath: url.path, contents: nil, attributes: [.posixPermissions: 0o600])
+      try data.write(to: url)
+      try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
+    } else {
+      let query = baseQuery(name)
+      if SecItemUpdate(query as CFDictionary, [kSecValueData as String: data] as CFDictionary) != errSecSuccess {
+        var add = query
+        add[kSecValueData as String] = data
+        add[kSecAttrLabel as String] = "TWP Portal (\(name))"
+        let status = SecItemAdd(add as CFDictionary, nil)
+        guard status == errSecSuccess else { throw PortalError.tool("Could not save the key to the Keychain (status \(status)).") }
+      }
+    }
+    lock.lock()
+    cache[name] = .some(value)
+    lock.unlock()
+  }
+
+  static func delete(_ name: String) {
+    if GrantStore.useFile { try? FileManager.default.removeItem(at: fileURL(name)) } else { SecItemDelete(baseQuery(name) as CFDictionary) }
+    lock.lock()
+    cache[name] = .some(nil)
+    lock.unlock()
+  }
+
+  private static func fileURL(_ name: String) -> URL { PortalPaths.supportDirectory.appendingPathComponent(name) }
+  private static func baseQuery(_ name: String) -> [String: Any] {
+    [kSecClass as String: kSecClassGenericPassword, kSecAttrService as String: GrantStore.service, kSecAttrAccount as String: name]
+  }
+  private static func keychainRead(_ name: String) -> Data? {
+    var q = baseQuery(name)
+    q[kSecReturnData as String] = true
+    q[kSecMatchLimit as String] = kSecMatchLimitOne
+    var out: CFTypeRef?
+    return SecItemCopyMatching(q as CFDictionary, &out) == errSecSuccess ? out as? Data : nil
+  }
+}
+
 public enum PortalPaths {
+  /// `~/Library/Application Support/TWP Portal`, or `TWP_PORTAL_HOME` (tests that must not touch the app's settings).
   public static var supportDirectory: URL {
     let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-    let dir = base.appendingPathComponent("TWP Portal", isDirectory: true)
+    let dir = ProcessInfo.processInfo.environment["TWP_PORTAL_HOME"].map { URL(fileURLWithPath: NSString(string: $0).expandingTildeInPath, isDirectory: true) }
+      ?? base.appendingPathComponent("TWP Portal", isDirectory: true)
     try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
     return dir
   }

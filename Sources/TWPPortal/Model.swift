@@ -38,6 +38,8 @@ final class PortalModel: ObservableObject {
   @Published var brain: Brain = .onDevice
   /// The local model server's state, refreshed at launch and after /brain commands.
   @Published var localBrain = LocalBrain.lastStatus
+  /// An OpenRouter key is stored (or in the environment): the OpenRouter menu entries are enabled.
+  @Published var openrouterReady = OpenRouter.hasKey
   @Published var dropTargeted = false
   @Published var sidebarTab: SidebarTab = .scenes
   /// The lightbulb: show the suggestion library even mid-conversation.
@@ -48,6 +50,8 @@ final class PortalModel: ObservableObject {
   @Published var selectedLocal: ShelfItem?
   // Picture engine (Apple's Image Playground, or an optional local Qwen server).
   @Published var pictureEngine: PictureEngine = .current
+  /// The OpenRouter picture model, for the check mark in the pictures menu.
+  @Published var openrouterImageModel = OpenRouter.imageModel
   /// Loaded state of the Qwen model, polled while a Qwen engine is selected.
   @Published var qwenStatus: QwenStatus?
   @Published var autoOffMinutes: Int? = PortalConfig.load().picturesAutoOff
@@ -234,6 +238,7 @@ final class PortalModel: ObservableObject {
 
   private func syncPictureSettings() {
     pictureEngine = .current
+    openrouterImageModel = OpenRouter.imageModel
     autoOffMinutes = PortalConfig.load().picturesAutoOff
     pollCount = 0
     pollPictures()
@@ -303,8 +308,8 @@ final class PortalModel: ObservableObject {
       DispatchQueue.main.async { Task { await self?.focusChanged(to: id) } }
     }
     portal.agent.imageGenerator = { [weak self] request in
-      // The optional Qwen engine draws by itself; progress lands in the "Working…" row.
-      if PictureEngine.current.isQwen {
+      // The optional Qwen and OpenRouter engines draw by themselves; progress lands in the "Working…" row.
+      if PictureEngine.current.canEdit {
         return try await Pictures.draw(request, progress: { text in DispatchQueue.main.async { self?.receive(.progress(text)) } })
       }
       do {
@@ -443,9 +448,11 @@ final class PortalModel: ObservableObject {
 
   func run(_ line: String) {
     guard !busy else { return }
-    history.append(line)
+    // A key typed into the input is never shown in the transcript or kept in the input history.
+    let secret = line.lowercased().hasPrefix("/openrouter key ") && !line.lowercased().hasSuffix(" clear")
+    if !secret { history.append(line) }
     historyIndex = nil
-    entries.append(Entry(kind: .user, text: line))
+    entries.append(Entry(kind: .user, text: secret ? "/openrouter key ••••••••" : line))
     startersRequested = false
     let words = line.split(separator: " ").map(String.init)
     if words.first == "/game" {
@@ -462,9 +469,10 @@ final class PortalModel: ObservableObject {
       await portal.handle(line)
       linking = false
       progressText = nil
-      if line.hasPrefix("/brain") {
+      if line.hasPrefix("/brain") || line.hasPrefix("/openrouter") {
         brain = portal.agent.brain
         localBrain = LocalBrain.lastStatus
+        openrouterReady = OpenRouter.hasKey
       }
       if line.hasPrefix("/pictures") { syncPictureSettings() } else if pictureEngine.isQwen { pollPictures() }
       // Let queued events land before the prompt comes back.

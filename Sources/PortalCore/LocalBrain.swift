@@ -98,7 +98,21 @@ public enum LocalBrain {
 
   public static var contextSize: Int { PortalConfig.load().brainContext ?? defaultContext }
 
-  /// One request: the model may call tools for several rounds, then answers in words.
+  /// Where a chat-completions request goes: the user's local server, or OpenRouter.
+  struct ChatServer {
+    var url: URL
+    var model: String
+    /// Sent with every request (OpenRouter's key and attribution); none for a local server.
+    var headers: [String: String] = [:]
+    /// "The local model server at …" / "OpenRouter", for messages.
+    var name: String
+    /// A failed answer in one plain sentence.
+    var explain: (_ status: Int, _ json: JSONValue, _ body: Data) -> String
+    /// Sees every successful answer (OpenRouter adds up the reported cost).
+    var onAnswer: (JSONValue) -> Void = { _ in }
+  }
+
+  /// One request to the local server: the model may call tools for several rounds, then answers in words.
   /// `execute` runs a tool call and returns what the model should read back.
   static func respond(system: String, user: String, tools: [AgentTool], progress: @Sendable (String) -> Void,
                       execute: (AgentTool, JSONValue) async -> String) async throws -> String {
@@ -106,6 +120,21 @@ public enum LocalBrain {
     guard let address = status.address, let model = status.model, let url = URL(string: address + "/chat/completions") else {
       throw PortalError.tool("The local model can't answer: \(status.detail).")
     }
+    let server = ChatServer(url: url, model: model, name: "The local model server at \(address)") { code, json, data in
+      let reason = json["error"]?["message"]?.stringValue ?? json["error"]?.stringValue ?? String(decoding: data.prefix(300), as: UTF8.self)
+      if reason.lowercased().contains("does not support tools") {
+        return "\(model) cannot call tools, so it cannot operate the portal. Choose another with /brain model <name>, or /brain on-device for Apple's."
+      }
+      return "The local model refused (\(code)): \(reason)"
+    }
+    return try await run(server, system: system, user: user, tools: tools, progress: progress, execute: execute)
+  }
+
+  /// The tool loop itself, shared by every OpenAI-compatible server.
+  static func run(_ server: ChatServer, system: String, user: String, tools: [AgentTool], progress: @Sendable (String) -> Void,
+                  execute: (AgentTool, JSONValue) async -> String) async throws -> String {
+    let model = server.model
+    let url = server.url
     let toolList: [JSONValue] = tools.map { tool in
       ["type": "function", "function": ["name": .string(tool.name), "description": .string(String(tool.description.prefix(1200))), "parameters": tool.inputSchema]]
     }
@@ -120,6 +149,7 @@ public enum LocalBrain {
       var request = URLRequest(url: url)
       request.httpMethod = "POST"
       request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+      for (field, value) in server.headers { request.setValue(value, forHTTPHeaderField: field) }
       request.httpBody = Data(JSONValue.object(body).serialized().utf8)
       let data: Data
       let response: URLResponse
@@ -128,17 +158,15 @@ public enum LocalBrain {
       } catch let error as URLError where error.code == .cancelled {
         throw CancellationError()
       } catch {
-        throw PortalError.tool("The local model server at \(address) stopped answering (\(error.localizedDescription)).")
+        throw PortalError.tool("\(server.name) stopped answering (\(error.localizedDescription)).")
       }
       let json = (try? JSONValue.parse(data)) ?? .null
       let code = (response as? HTTPURLResponse)?.statusCode ?? 0
-      guard code == 200, let message = json["choices"]?[0]?["message"] else {
-        let reason = json["error"]?["message"]?.stringValue ?? json["error"]?.stringValue ?? String(decoding: data.prefix(300), as: UTF8.self)
-        if reason.lowercased().contains("does not support tools") {
-          throw PortalError.tool("\(model) cannot call tools, so it cannot operate the portal. Choose another with /brain model <name>, or /brain on-device for Apple's.")
-        }
-        throw PortalError.tool("The local model refused (\(code)): \(reason)")
+      // Some servers (OpenRouter among them) report a failure inside a 200 answer.
+      guard code == 200, json["error"] == nil, let message = json["choices"]?[0]?["message"] else {
+        throw PortalError.tool(server.explain(code, json, data))
       }
+      server.onAnswer(json)
       let calls = message["tool_calls"]?.arrayValue ?? []
       guard !calls.isEmpty else {
         let text = clean(message["content"]?.stringValue ?? "")
@@ -151,7 +179,10 @@ public enum LocalBrain {
         return text
       }
       // Echo the assistant's turn back exactly, then answer each call.
-      messages.append(["role": "assistant", "content": .string(message["content"]?.stringValue ?? ""), "tool_calls": .array(calls)])
+      var turn: [String: JSONValue] = ["role": "assistant", "content": .string(message["content"]?.stringValue ?? ""), "tool_calls": .array(calls)]
+      // A reasoning model's hidden reasoning must come back with its tool calls, or some providers refuse the next round.
+      if let reasoning = message["reasoning_details"], reasoning.arrayValue?.isEmpty == false { turn["reasoning_details"] = reasoning }
+      messages.append(.object(turn))
       for call in calls {
         let name = call["function"]?["name"]?.stringValue ?? ""
         let raw = call["function"]?["arguments"]

@@ -1,6 +1,6 @@
 # TWP Portal for Mac
 
-A native macOS companion for [thinkwith.pictures](https://thinkwith.pictures): link it to your account once, then build and edit scenes from a terminal-style window, in plain words or with direct commands. The language model and the image model are Apple's, running on the Mac. No API key, no model download. A local Qwen-Image server can optionally take over picture drawing and adds editing and filling.
+A native macOS companion for [thinkwith.pictures](https://thinkwith.pictures): link it to your account once, then build and edit scenes from a terminal-style window, in plain words or with direct commands. The language model and the image model are Apple's, running on the Mac. No API key, no model download. A local Qwen-Image server can optionally take over picture drawing and adds editing and filling, and an OpenRouter key can optionally serve both text and pictures from hosted models.
 
 > **Needs macOS 27 on Apple silicon with Apple Intelligence turned on.** This first release is source only: build it yourself with the two commands under [Build and run](#build-and-run). Signed, ready-to-run downloads will come soon.
 
@@ -119,6 +119,21 @@ Image Playground only draws new pictures. For editing and filling, and for drawi
 The contract is one call, `POST /generate-image` with JSON `{prompt, model: "turbo"|"base", width, height, alpha, images: [base64…]}` answering with PNG bytes (`PictureEngine.swift`). Loaded state, step progress and unloading come from the daemon's unix socket (`status` and `unload` over `POST /rpc`), looked for at `$LOCALGEN_HOME/.run/daemon.sock` and `~/local-generators/.run/daemon.sock`, or set with `/pictures socket <path>`; without it pictures still work and the light only shows reachable or not.
 - Stickers must be transparent, so generated stickers and `/cutout` go through Vision's foreground-subject mask.
 
+## Optional: OpenRouter for text and pictures
+
+With your own [OpenRouter](https://openrouter.ai) key, hosted models can answer plain-language requests and draw, edit and fill pictures. It is off until you choose it; Apple's models stay the default.
+
+> **Privacy.** With OpenRouter selected, what you type, what the tools read back (scene names, ids, descriptions) and the pictures you draw, edit or fill leave your Mac: they go to OpenRouter and the model's provider, and each request is billed to your key. Your TWP sign-in is never sent to OpenRouter, and the key is only ever sent to `openrouter.ai` (the address is fixed in `OpenRouter.swift`). The portal says this once, the first time you choose an OpenRouter option.
+
+- `/openrouter key <key>` checks the key with OpenRouter and stores it the same way as the sign-in: a `0600` file in `~/Library/Application Support/TWP Portal/` for an ad-hoc build, the login Keychain for a Developer-ID build. Never in `config.json`. In the app the line is masked in the transcript and kept out of the input history. (From a shell, `twp openrouter key …` lands in your shell history; type it at the `twp` prompt or in the app instead.) With no key stored, `OPENROUTER_API_KEY` from the environment is used.
+- `/openrouter` shows the key (masked) and where it came from, the models, the key's remaining limit and the account's credit. `/openrouter key clear` removes it. `/openrouter test` sends one short question with one harmless local tool, to show that the key, the model and its tool calling work, without a TWP account (about $0.0001).
+- **Text.** `/brain openrouter` (or the model menu beside the input). `/brain model <id>` takes any OpenRouter model id that lists tool support; ids without it are refused. `/brain model auto` returns to the default, `anthropic/claude-haiku-5.5`, chosen from the live list in November 2026 for reliable tool calls at $0.10 / $0.50 per million tokens (`meta/muse-ember` did as well in testing, at the same price). Like a local model server, it gets every tool with its full schema and the same 16-round tool loop (`LocalBrain.run`).
+- **Pictures.** `/pictures openrouter` (or the light's menu), then `/imagine`, `/edit`, `/fill` and the agent's drawing and editing go through OpenRouter's Images API. Two models are offered by name, in the pictures menu or as `/pictures model qwen` and `/pictures model seedream`: Qwen-Image 2.1 Turbo (the default, $0.0184 a picture, the same family as the local Qwen engine) and Seedream 5.5 ($0.02 a picture, $0.028 an edit, and it draws stickers with real transparency). `/pictures model <id>` takes any other id from `openrouter.ai/api/v1/images/models`; `/pictures model auto` returns to the default. Only the parameters a model lists are sent.
+- **Stickers stay transparent.** A model that offers `background: transparent` (for example `bytedance-seed/seedream-5-5`) is asked for it. Anything that comes back opaque, including everything from the default model, goes through the same Vision cut-out as `/cutout`. A sticker sent for editing is put on white first (these models read transparency as black) and cut out again afterwards.
+- **Fill** works as with Qwen: the box is marked in magenta, and the answer is blended back through a soft mask, so pixels outside the box are unchanged whatever the model returns.
+- Errors read as sentences: no key, key refused, out of credit or key limit reached, rate limited, refused by moderation, a model without tool support, a model that cannot take a picture as input.
+- OpenRouter's attribution headers are sent (`HTTP-Referer: https://github.com/Carbonitex/twp-portal`, title "TWP Portal").
+
 ## Private Cloud Compute
 
 `/brain private-cloud` switches to Apple's server model. It reports available but refuses requests unless the app is signed with Apple's managed Private Cloud Compute entitlement (<https://developer.apple.com/private-cloud-compute/>).
@@ -126,7 +141,7 @@ The contract is one call, `POST /generate-image` with JSON `{prompt, model: "tur
 ## Where things are stored
 
 - Sign-in: a build signed with a Developer ID keeps it in the login Keychain (service `pictures.thinkwith.portal`, one item per environment). An ad-hoc build (every local `scripts/build.sh`) keeps it in a `0600` file in `~/Library/Application Support/TWP Portal/` instead, because the Keychain treats each ad-hoc rebuild as a different app and would ask for the login password repeatedly. `TWP_PORTAL_TOKEN_FILE=1` forces the file, `=0` the Keychain.
-- `~/Library/Application Support/TWP Portal/`: `config.json` (environment, model), `clients.json` (registered OAuth client ids).
+- `~/Library/Application Support/TWP Portal/`: `config.json` (environment, models, picture engine), `clients.json` (registered OAuth client ids). An OpenRouter key is a `0600` file `openrouter-key` there (ad-hoc builds) or a Keychain item with account `openrouter` (Developer-ID builds).
 - Access tokens last an hour; refresh tokens rotate on every use. The CLI and the app share one grant and refresh under a file lock, because replaying a spent refresh token revokes the grant.
 - Revoke from the app (**Unlink**), `/logout`, or the website's Account window under Connected apps.
 
@@ -144,6 +159,7 @@ xcrun stapler staple "dist/TWP Portal.app"
 
 - No Swift macros that need Xcode's plugins: no `@Generable` (schemas are built with `DynamicGenerationSchema`), no `@State` or `@Observable` in the app (`ObservableObject` instead).
 - `TWP_PORTAL_RUN` holds newline-separated lines the app runs at launch, for demos and checks.
+- `TWP_PORTAL_HOME` replaces `~/Library/Application Support/TWP Portal` (config, sign-in, keys), so a test run of the CLI cannot change the settings of an app that is open. Pair it with `TWP_PORTAL_SHELF`.
 
 ## Licence
 

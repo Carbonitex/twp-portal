@@ -19,10 +19,15 @@ public enum PortalEvent: Sendable {
 /// Mac. `privateCloud` is Apple's larger server model; it needs a managed
 /// entitlement from Apple, so it only works in a properly signed build.
 /// `local` is a model server the user runs themselves (see `LocalBrain`).
+/// `openrouter` is a hosted model through the user's own OpenRouter key (see `OpenRouter`).
 public enum Brain: String, Sendable, CaseIterable {
   case onDevice = "on-device"
   case privateCloud = "private-cloud"
   case local
+  case openrouter
+
+  /// Answers through the OpenAI-style chat-completions tool loop in `LocalBrain`, not Foundation Models.
+  public var usesChatCompletions: Bool { self == .local || self == .openrouter }
 }
 
 /// What happens before a risky tool runs.
@@ -303,6 +308,8 @@ public final class PortalAgent: @unchecked Sendable {
       // From the last check, so menus never wait on the network; Portal.handle checks afresh before a request.
       let status = LocalBrain.lastStatus
       return (status.ok, status.detail)
+    case .openrouter:
+      return OpenRouter.hasKey ? (true, "\(OpenRouter.textModel) on OpenRouter") : (false, "needs a key: /openrouter key <key>")
     }
   }
 
@@ -311,6 +318,7 @@ public final class PortalAgent: @unchecked Sendable {
     case .onDevice: return SystemLanguageModel.default.contextSize
     case .privateCloud: return (try? await PrivateCloudComputeLanguageModel().contextSize) ?? 32768
     case .local: return LocalBrain.contextSize
+    case .openrouter: return OpenRouter.contextSize
     }
   }
 
@@ -318,7 +326,8 @@ public final class PortalAgent: @unchecked Sendable {
     switch brain {
     case .onDevice: return LanguageModelSession(model: SystemLanguageModel.default, tools: tools, instructions: instructions)
     case .privateCloud: return LanguageModelSession(model: PrivateCloudComputeLanguageModel(), tools: tools, instructions: instructions)
-    case .local: return LanguageModelSession(model: SystemLanguageModel.default, tools: tools, instructions: instructions)  // never used: local requests go through LocalBrain
+    // Never used: these requests go through LocalBrain's loop.
+    case .local, .openrouter: return LanguageModelSession(model: SystemLanguageModel.default, tools: tools, instructions: instructions)
     }
   }
 
@@ -393,8 +402,8 @@ public final class PortalAgent: @unchecked Sendable {
         }
         return MCPResult(isError: false, text: JSONValue.object(["pictures": .array(rows)]).serialized(), images: [])
       }))
-    // Editing exists only with the optional Qwen engine, so the tool is offered only then.
-    if PictureEngine.current.isQwen {
+    // Editing exists only with an engine that can edit (Qwen or OpenRouter), so the tool is offered only then.
+    if PictureEngine.current.canEdit {
       tools.append(AgentTool(
         name: "edit_local_picture",
         description: "Change a picture on this Mac's Local shelf as instructed, for example recolour it, restyle it, or add or remove something. Saves the result as a new Local picture and returns its name. It is not uploaded.",
@@ -537,8 +546,8 @@ public final class PortalAgent: @unchecked Sendable {
     if !context.isEmpty { context += "\n" }
 
     var chosen: [AgentTool]
-    // A local model server gets every tool: its window is large, and routing would need Apple's model.
-    if brain == .local || all.reduce(0, { $0 + $1.estimatedTokens }) <= toolBudget {
+    // A local model server or OpenRouter gets every tool: its window is large, and routing would need Apple's model.
+    if brain.usesChatCompletions || all.reduce(0, { $0 + $1.estimatedTokens }) <= toolBudget {
       chosen = all
     } else {
       chosen = await route(request, tools: all, context: context)
@@ -553,7 +562,7 @@ public final class PortalAgent: @unchecked Sendable {
       let wantsUse = Self.asksToUsePicture(request)
       if !wantsUse, chosen.count < all.count { chosen.removeAll { Self.pictureConsumers.contains($0.name) } }
       // With every tool on offer (a local model server) nothing is withheld, so the same test decides alone.
-      useGeneratedNow.value = wantsUse && (chosen.count < all.count || brain == .local)
+      useGeneratedNow.value = wantsUse && (chosen.count < all.count || brain.usesChatCompletions)
     } else {
       useGeneratedNow.value = false
     }
@@ -576,15 +585,18 @@ public final class PortalAgent: @unchecked Sendable {
       When finished, say what changed in one or two plain sentences. If a tool returns ERROR, explain it simply.
       """
 
-    if brain == .local {
+    if brain.usesChatCompletions {
       let emit = self.emit
       let confirm = self.confirm
-      let reply = try await LocalBrain.respond(system: instructions, user: context + request, tools: chosen, progress: { emit(.progress($0)) }) { [weak self] tool, args in
+      let execute: (AgentTool, JSONValue) async -> String = { [weak self] tool, args in
         await BridgedTool.execute(
           tool, args, outputLimit: 6000, emit: emit, confirm: confirm,
           remember: { name, text in self?.note(name, text) },
           touched: { id, name in self?.touch(id, name, read: Self.isRead(tool.name)) })
       }
+      let reply = brain == .openrouter
+        ? try await LocalBrain.run(try OpenRouter.chatServer(), system: instructions, user: context + request, tools: chosen, progress: { emit(.progress($0)) }, execute: execute)
+        : try await LocalBrain.respond(system: instructions, user: context + request, tools: chosen, progress: { emit(.progress($0)) }, execute: execute)
       return finish(request, reply)
     }
     do {

@@ -98,6 +98,16 @@ public enum ImagePipeline {
     return out
   }
 
+  /// The picture on a plain white ground, for models that do not read transparency (they see it as black).
+  static func flattened(_ image: CGImage) throws -> CGImage {
+    let ctx = try bitmap(width: image.width, height: image.height)
+    ctx.setFillColor(red: 1, green: 1, blue: 1, alpha: 1)
+    ctx.fill(CGRect(x: 0, y: 0, width: image.width, height: image.height))
+    ctx.draw(image, in: CGRect(x: 0, y: 0, width: image.width, height: image.height))
+    guard let out = ctx.makeImage() else { throw PortalError.image("Couldn't prepare the picture.") }
+    return out
+  }
+
   /// `top` inside `rect`, `bottom` everywhere else, with a soft edge a few pixels wide so no seam shows.
   static func blend(_ top: CGImage, over bottom: CGImage, inside rect: CGRect) throws -> CGImage {
     let extent = CGRect(x: 0, y: 0, width: bottom.width, height: bottom.height)

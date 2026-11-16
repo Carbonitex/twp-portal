@@ -5,7 +5,7 @@ public struct PortalConfig: Codable {
   public var environment: String = "prod"
   public var brain: String = Brain.onDevice.rawValue
   // Optional keys stay optional so older config files still decode.
-  /// Picture engine: "apple" (default), "qwen-turbo" or "qwen".
+  /// Picture engine: "apple" (default), "qwen-turbo", "qwen" or "openrouter".
   public var pictures: String?
   /// localgen server address; nil means http://127.0.0.1:8740.
   public var picturesServer: String?
@@ -18,6 +18,12 @@ public struct PortalConfig: Codable {
   public var brainServer: String?
   public var brainModel: String?
   public var brainContext: Int?
+  /// OpenRouter model ids for the `openrouter` brain and picture engine; nil means the defaults in `OpenRouter`.
+  /// The key itself is never kept here (see `SecretStore`).
+  public var openrouterModel: String?
+  public var openrouterImageModel: String?
+  /// The "this leaves your Mac" notice has been shown once.
+  public var openrouterNoticeShown: Bool?
 
   private static var url: URL { PortalPaths.supportDirectory.appendingPathComponent("config.json") }
   public static func load() -> PortalConfig {
@@ -85,18 +91,21 @@ public final class Portal: @unchecked Sendable {
     Pictures stay on this Mac (the Local shelf) until you upload them:
       /imagine <text> [--background] [x3]     draw a picture, or up to 4 to choose from
       /cutout <name or file>                  remove a picture's background
-      /edit <name or file> <what to change>   repaint a picture as instructed (Qwen engine)
-      /fill <name or file> <area> <what>      paint something into one part of a picture (Qwen engine);
+      /edit <name or file> <what to change>   repaint a picture as instructed (Qwen or OpenRouter engine)
+      /fill <name or file> <area> <what>      paint something into one part of a picture (Qwen or OpenRouter);
                                               area is left,top,width,height in percent, or a word like bottom-left
-      /pictures [apple|qwen-turbo|qwen]       which engine draws; also: server <url>, unload, auto-off <minutes|never>
+      /pictures [apple|qwen-turbo|qwen|openrouter]  which engine draws; also: model <id> (OpenRouter),
+                                              server <url>, unload, auto-off <minutes|never> (Qwen)
       /local            what is on the Local shelf
       /import <file>    copy a picture onto the Local shelf
       /upload <name or file> [sticker|background]   send one to your TWP gallery (this spends strain)
       /discard <name>   move a Local picture to the Trash
       /tools            every tool the server offers
       /call <tool> <json>                     run one tool directly
-      /brain [on-device|private-cloud|local]  which model answers; local is your own model server
-                                              (Ollama, llama-server, LM Studio): /brain server <url>, /brain model <name>
+      /brain [on-device|private-cloud|local|openrouter]  which model answers; local is your own model server
+                                              (Ollama, llama-server, LM Studio): /brain server <url>, /brain model <name>;
+                                              openrouter is a hosted model on your own key: /brain model <id>
+      /openrouter       OpenRouter key, models and credit; also: key <key>, key clear, test
       /clear            forget the conversation so far
     """
 
@@ -166,6 +175,8 @@ public final class Portal: @unchecked Sendable {
         if agent.brain == .local {
           let status = await LocalBrain.check()
           guard status.ok else { throw PortalError.tool("The local model can't answer right now: \(status.detail). Slash commands still work (/help), and /brain on-device goes back to Apple's.") }
+        } else if agent.brain == .openrouter {
+          guard OpenRouter.hasKey else { throw PortalError.tool(OpenRouter.noKey + " Or /brain on-device to go back to Apple's.") }
         } else {
           let status = PortalAgent.availability(agent.brain)
           guard status.ok else {
@@ -300,17 +311,21 @@ public final class Portal: @unchecked Sendable {
       let prompt = text.trimmingCharacters(in: .whitespaces)
       guard !prompt.isEmpty else { throw PortalError.tool("Usage: /imagine <what to draw> [--background] [x3]") }
       let engine = PictureEngine.current
-      if engine.isQwen { emit(.info("Drawing with \(engine.label)\(engine == .qwen ? " (several minutes a picture)" : " (about a minute a picture)")…")) }
+      if engine == .openrouter {
+        emit(.info("Drawing with \(OpenRouter.imageModel) on OpenRouter…"))
+      } else if engine.isQwen {
+        emit(.info("Drawing with \(engine.label)\(engine == .qwen ? " (several minutes a picture)" : " (about a minute a picture)")…"))
+      }
       let images = try await agent.imageGenerator(PictureRequest(prompt: prompt, purpose: background ? .background : .sticker, count: count))
       var names: [String] = []
       for image in images {
-        // Qwen draws stickers transparent already; Apple's pictures need their background removed.
+        // Qwen and OpenRouter stickers come back transparent already; Apple's pictures need their background removed.
         let final = background || ImagePipeline.hasTransparency(image) ? image : try ImagePipeline.cutout(image)
         let item = try LocalShelf.save(final, purpose: background ? .background : .sticker, label: prompt, prompt: prompt)
         if let data = try? Data(contentsOf: item.url) { emit(.image(data, caption: item.name)) }
         names.append(item.name)
       }
-      if names.count < count { emit(.info(engine.isQwen ? "Only \(names.count) of \(count) pictures were finished." : "Image Playground makes one picture at a time; run /imagine again for another.")) }
+      if names.count < count { emit(.info(engine.canEdit ? "Only \(names.count) of \(count) pictures were finished." : "Image Playground makes one picture at a time; run /imagine again for another.")) }
       agent.note("drew \(background ? "background" : "sticker") picture(s), kept on this Mac, not uploaded", JSONValue.object(["localNames": .array(names.map { .string($0) })]).serialized())
       emit(.info("Saved to Local: \(names.joined(separator: ", ")). Nothing was uploaded. /upload \(names[0]) when you have picked one."))
     case "edit":
@@ -368,25 +383,39 @@ public final class Portal: @unchecked Sendable {
         }
         config.save()
       case "model":
-        config.brainModel = words.count > 1 && words[1].lowercased() != "auto" ? words[1...].joined(separator: " ") : nil
+        let wanted = words.count > 1 && words[1].lowercased() != "auto" ? words[1...].joined(separator: " ") : nil
+        // The model of whichever chat-completions brain is selected: OpenRouter's, or the local server's.
+        if agent.brain == .openrouter {
+          if let wanted, let problem = await OpenRouter.problem(withTextModel: wanted) { throw PortalError.tool(problem) }
+          config.openrouterModel = wanted
+        } else {
+          config.brainModel = wanted
+        }
         config.save()
       case "context":
         guard words.count > 1, let size = Int(words[1]), size >= 4096 else { throw PortalError.tool("Usage: /brain context <tokens>, at least 4096 (the default is \(LocalBrain.defaultContext)).") }
         config.brainContext = size
         config.save()
       case let word?:
-        guard let brain = Brain(rawValue: word) else { throw PortalError.tool("Choose on-device, private-cloud or local. For local also: /brain server <url>, /brain model <name>, /brain context <tokens>.") }
+        guard let brain = Brain(rawValue: word) else { throw PortalError.tool("Choose on-device, private-cloud, local or openrouter. For local also: /brain server <url>, /brain model <name>, /brain context <tokens>; for openrouter: /brain model <id>.") }
+        if brain == .openrouter {
+          guard OpenRouter.hasKey else { throw PortalError.tool(OpenRouter.noKey) }
+          privacyNotice(&config)
+        }
         agent.brain = brain
         config.brain = brain.rawValue
         config.save()
       }
       let local = await LocalBrain.check()
       var lines = Brain.allCases.map { b in "\(b == agent.brain ? "●" : "○") \(b.rawValue.rightPad(14)) \(PortalAgent.availability(b).detail)" }
-      if agent.brain == .local || words.first.map({ ["server", "model", "context", "local"].contains($0.lowercased()) }) ?? false {
+      if agent.brain == .openrouter { lines.append("OpenRouter model: \(OpenRouter.textModel) (/brain model <id>, or auto for the default, \(OpenRouter.defaultTextModel))") }
+      if agent.brain == .local || (agent.brain != .openrouter && words.first.map({ ["server", "model", "context", "local"].contains($0.lowercased()) }) ?? false) {
         if !local.models.isEmpty { lines.append("models on \(local.address ?? "?"): " + local.models.joined(separator: ", ")) }
         lines.append("local context window: \(LocalBrain.contextSize) tokens (/brain context <tokens> if your server is set up differently)")
       }
       emit(.info(lines.joined(separator: "\n")))
+    case "openrouter":
+      try await openrouter(rest)
     case "clear":
       agent.reset()
       emit(.info("Conversation memory cleared."))
@@ -429,6 +458,12 @@ public final class Portal: @unchecked Sendable {
     case "socket":
       config.picturesControl = words.count > 1 ? words[1...].joined(separator: " ") : nil
       config.save()
+    case "model":
+      let given = words.count > 1 && words[1].lowercased() != "auto" ? words[1] : nil
+      let wanted = given.map { id in OpenRouter.namedImageModels.first { $0.name == id.lowercased() }?.id ?? id }
+      if let wanted, let problem = await OpenRouter.problem(withImageModel: wanted) { throw PortalError.tool(problem) }
+      config.openrouterImageModel = wanted
+      config.save()
     case "unload", "off":
       emit(.info(QwenServer.unload() ? "Unloaded the Qwen model; its memory is free. It loads again on the next picture." : "Nothing was unloaded (the model is not loaded, is busy, or the control socket was not found)."))
       return
@@ -443,7 +478,11 @@ public final class Portal: @unchecked Sendable {
       config.save()
     case let word?:
       let aliases = ["playground": "apple", "turbo": "qwen-turbo", "base": "qwen", "qwen-base": "qwen"]
-      guard let engine = PictureEngine(rawValue: aliases[word] ?? word) else { throw PortalError.tool("Choose apple, qwen-turbo or qwen. Also: server <url>, unload, auto-off <minutes|never>.") }
+      guard let engine = PictureEngine(rawValue: aliases[word] ?? word) else { throw PortalError.tool("Choose apple, qwen-turbo, qwen or openrouter. Also: model <id> (OpenRouter), server <url>, unload, auto-off <minutes|never> (Qwen).") }
+      if engine == .openrouter {
+        guard OpenRouter.hasKey else { throw PortalError.tool(OpenRouter.noKey) }
+        privacyNotice(&config)
+      }
       if engine.isQwen, await !QwenServer.reachable() {
         emit(.info("Note: nothing is answering at \(QwenServer.address.absoluteString) right now. The Qwen engines need a localgen server; /pictures server <url> sets another address."))
       }
@@ -452,6 +491,12 @@ public final class Portal: @unchecked Sendable {
     }
     let current = PictureEngine.current
     var lines = PictureEngine.allCases.map { "\($0 == current ? "●" : "○") \($0.rawValue.rightPad(11)) \($0.label): \($0.detail)" }
+    if current == .openrouter || words.first?.lowercased() == "model" {
+      lines.append("OpenRouter picture model: \(OpenRouter.imageModel) (/pictures model <name or id>, or auto for the default, \(OpenRouter.defaultImageModel))")
+      for named in OpenRouter.namedImageModels {
+        lines.append("  \(named.id == OpenRouter.imageModel ? "●" : "○") \(named.name.rightPad(9)) \(named.note)")
+      }
+    }
     if current.isQwen {
       let up = await QwenServer.reachable()
       var status = QwenServer.status()
@@ -460,6 +505,43 @@ public final class Portal: @unchecked Sendable {
       lines.append("auto-off: \(config.picturesAutoOff.map { "after \($0) idle minutes (while TWP Portal is open)" } ?? "left to the server")")
     }
     emit(.info(lines.joined(separator: "\n")))
+  }
+
+  /// /openrouter: the key, status, and a one-request self-test.
+  private func openrouter(_ rest: String) async throws {
+    let words = rest.split(separator: " ").map(String.init)
+    switch words.first?.lowercased() {
+    case nil, "status": break
+    case "key":
+      guard words.count > 1 else { throw PortalError.tool("Usage: /openrouter key <key>, or /openrouter key clear") }
+      if ["clear", "remove", "delete", "off"].contains(words[1].lowercased()) {
+        OpenRouter.clearKey()
+        emit(.info(OpenRouter.hasKey ? "Removed the stored key. OPENROUTER_API_KEY is set in this environment, so that one is still used." : "Removed the OpenRouter key from this Mac."))
+      } else {
+        try await OpenRouter.storeKey(words[1])
+        emit(.info("Saved the key on this Mac (never in config.json). Choose OpenRouter with /brain openrouter or /pictures openrouter."))
+      }
+    case "test":
+      guard OpenRouter.hasKey else { throw PortalError.tool(OpenRouter.noKey) }
+      emit(.info("Asking \(OpenRouter.textModel) one short question that needs a tool (no TWP account involved)…"))
+      let result = try await OpenRouter.selfTest(progress: { [emit] in emit(.progress($0)) })
+      emit(.info("\(OpenRouter.textModel): \(result.reply)"))
+      emit(.info(result.toolRan ? "Tool calling works: the model called the test tool and used its answer." : "The model answered without calling the tool, so it may not operate the portal reliably."))
+    default:
+      throw PortalError.tool("Usage: /openrouter [key <key>|key clear|test]")
+    }
+    emit(.info((await OpenRouter.statusLines()).joined(separator: "\n")))
+  }
+
+  /// Said once, the first time an OpenRouter option is chosen.
+  private func privacyNotice(_ config: inout PortalConfig) {
+    guard config.openrouterNoticeShown != true else { return }
+    config.openrouterNoticeShown = true
+    emit(.info("""
+      With OpenRouter, what you type, what the tools read back (scene names, ids, descriptions) and the pictures you
+      draw, edit or fill leave this Mac: they go to OpenRouter and the model's provider, billed to your key. Your TWP
+      sign-in is never sent. Apple's options keep everything on this Mac: /brain on-device and /pictures apple go back.
+      """))
   }
 
   private static func path(_ text: String) -> String {
