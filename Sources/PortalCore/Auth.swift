@@ -53,6 +53,14 @@ public struct PortalEnvironment: Hashable, Sendable, Codable {
 
 // MARK: - Errors
 
+public enum GameSignIn: Sendable {
+  case url(URL)
+  /// Linked before the game permission existed, or it was declined: link again.
+  case needsPermission
+  case notLinked
+  case unavailable(String)
+}
+
 public enum PortalError: LocalizedError {
   case notSignedIn
   case signInFailed(String)
@@ -222,7 +230,9 @@ public enum PortalPaths {
 /// it opens the site's own consent page in the default browser and receives a
 /// one-time code on a loopback port (RFC 8252), then swaps it for tokens.
 public actor PortalAuth {
-  public static let defaultScopes = ["twp:profile", "twp:read", "twp:build", "twp:publish", "twp:play"]
+  public static let defaultScopes = ["twp:profile", "twp:read", "twp:build", "twp:publish", "twp:play", "twp:session"]
+  /// Lets the app's embedded game sign in to the website as the linked account.
+  public static let gameScope = "twp:session"
   public let environment: PortalEnvironment
   private let session: URLSession
   private var refreshing: Task<StoredGrant, Error>?
@@ -234,6 +244,32 @@ public actor PortalAuth {
 
   public var isSignedIn: Bool { GrantStore.load(environment) != nil }
   public var grantedScopes: [String] { (GrantStore.load(environment)?.scope ?? "").split(separator: " ").map(String.init) }
+
+  /// A one-time address that signs a web view in to the website as the linked
+  /// account. It works once and for one minute, so load it straight away and
+  /// never show or log it.
+  public func gameSignIn() async -> GameSignIn {
+    guard isSignedIn else { return .notLinked }
+    guard grantedScopes.contains(Self.gameScope) else { return .needsPermission }
+    do {
+      var req = URLRequest(url: environment.origin.appendingPathComponent("api/twp/game-session"))
+      req.httpMethod = "POST"
+      req.setValue("Bearer \(try await accessToken())", forHTTPHeaderField: "Authorization")
+      let (data, resp) = try await session.data(for: req)
+      let status = (resp as? HTTPURLResponse)?.statusCode ?? 0
+      let json = (try? JSONValue.parse(data)) ?? .null
+      if status == 200, let code = json["code"]?.stringValue, code.allSatisfy({ $0.isLetter || $0.isNumber }) {
+        // Built from this app's own server address, never from an address in the answer.
+        var c = URLComponents(url: environment.origin.appendingPathComponent("api/auth/qr/claim"), resolvingAgainstBaseURL: false)!
+        c.queryItems = [.init(name: "code", value: code)]
+        if let url = c.url { return .url(url) }
+      }
+      if status == 403, json["error"]?.stringValue == "insufficient_scope" { return .needsPermission }
+      return .unavailable(json["message"]?.stringValue ?? "the server answered \(status)")
+    } catch {
+      return .unavailable(error.localizedDescription)
+    }
+  }
 
   /// A bearer token good for at least the next minute, refreshing if needed.
   public func accessToken(forceRefresh: Bool = false) async throws -> String {

@@ -53,6 +53,15 @@ While nothing has been asked yet, the chat area shows a library of suggestion ca
 
 Publishing a scene, removing objects and destructive `api_call` operations always ask for confirmation first, whatever the model decided. In the CLI without a keyboard they are refused unless `--yes` is passed.
 
+## The game, inside the window
+
+The gamepad button in the toolbar (or `/game`, or ⌘G) shows the live game beside the chat: the real website in an embedded web view, not a picture of it.
+
+- **It is signed in as you.** Linking asks for one extra permission, "Open the game signed in as you". With it the app fetches a one-time, one-minute sign-in code and hands it straight to the web view; the code is never shown, logged or given to a model. If you linked before this existed, the bar above the game offers "Link Again to Sign In…".
+- **The chat follows the game.** Pick a scene in the sidebar and the game walks there; walk through a door in the game and that scene becomes "this scene" for your next request. After a request changes a scene, the game loads it again.
+- **View as guest.** The person-with-a-question-mark button shows the same scene in a second, cookie-less view: exactly what a visitor who is not signed in sees. `/game guest` and `/game me` switch from the keyboard.
+- **Its sign-in is a normal website session** kept in this app's own web data, separate from Safari. The app and its game are one unit, though: `/logout` signs the game out as well, and revoking the app on the website's connected-apps page ends the game's session along with the chat link.
+
 ## How the agent fits a small model
 
 Apple's on-device model has an 8,192-token context window, and the 28 tools' schemas alone are larger than that. So each request runs in two steps:

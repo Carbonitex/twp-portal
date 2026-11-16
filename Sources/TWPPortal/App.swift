@@ -21,6 +21,7 @@ struct TWPPortalApp: App {
       CommandMenu("Portal") {
         Button("Refresh Scenes") { Task { await model.refreshAccount() } }.keyboardShortcut("r")
         Button("Refresh Preview") { Task { await model.refreshPreview() } }.keyboardShortcut("r", modifiers: [.command, .shift])
+        Button(model.gameShown ? "Hide Game" : "Show Game") { model.setGame(!model.gameShown) }.keyboardShortcut("g")
         Divider()
         Button("Show Local Pictures") { model.sidebarTab = .local }.keyboardShortcut("l")
         Button("Clear Conversation") { model.run("/clear") }.keyboardShortcut("k")
@@ -48,8 +49,22 @@ struct RootView: View {
       Sidebar().navigationSplitViewColumnWidth(min: 220, ideal: 260, max: 340)
     } detail: {
       HSplitView {
-        Terminal().frame(minWidth: 420)
-        if model.focus != nil { Inspector().frame(minWidth: 260, idealWidth: 360, maxWidth: 560) }
+        // With the game showing it takes the room and stands in for the still preview.
+        if model.gameShown {
+          GamePane(game: model.activeGame).frame(minWidth: 340, idealWidth: 760).layoutPriority(1)
+          if !model.chatHidden { Terminal().frame(minWidth: 280, idealWidth: 360, maxWidth: 560) }
+        } else {
+          Terminal().frame(minWidth: 420)
+          if model.focus != nil { Inspector().frame(minWidth: 260, idealWidth: 360, maxWidth: 560) }
+        }
+      }
+    }
+    .toolbar {
+      ToolbarItem(placement: .primaryAction) {
+        Button { model.setGame(!model.gameShown) } label: {
+          Label("Game", systemImage: model.gameShown ? "gamecontroller.fill" : "gamecontroller")
+        }
+        .help(model.gameShown ? "Hide the game" : "Show the live game beside the chat")
       }
     }
     .alert("Please confirm", isPresented: Binding(get: { model.confirmQuestion != nil }, set: { if !$0 { model.answer(false) } })) {

@@ -29,6 +29,7 @@ struct SlashCommand: Identifiable {
     .init(name: "/scene", usage: "/scene <id>", summary: "Details and objects of one scene"),
     .init(name: "/focus", usage: "/focus <id>", summary: "Make \"this scene\" mean that scene"),
     .init(name: "/preview", usage: "/preview [id]", summary: "Render a picture of a scene"),
+    .init(name: "/game", usage: "/game [on|off|reload|guest|me|<scene id>]", summary: "Show the live game beside the chat"),
     .init(name: "/open", usage: "/open [id]", summary: "Open a scene in the browser"),
     .init(name: "/imagine", usage: "/imagine <text> [--background]", summary: "Draw a picture, kept on this Mac"),
     .init(name: "/cutout", usage: "/cutout <name or file>", summary: "Remove a picture's background"),

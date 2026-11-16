@@ -53,6 +53,22 @@ final class PortalModel: ObservableObject {
   @Published var autoOffMinutes: Int? = PortalConfig.load().picturesAutoOff
   /// "step 3 of 8" while a picture renders.
   @Published var progressText: String?
+  /// The live game beside the chat (the website, embedded). Remembered between launches.
+  @Published var gameShown = UserDefaults.standard.bool(forKey: "gameShown") {
+    didSet { UserDefaults.standard.set(gameShown, forKey: "gameShown") }
+  }
+  /// Give the game the whole window.
+  @Published var chatHidden = false
+  let game = GameSession()
+  /// A second, cookie-less copy of the game: the scene as a visitor sees it.
+  let guestGame = GameSession(guestOnly: true)
+  @Published var guestView = false
+  /// The link lacks the game permission, so the game cannot sign in until this Mac is linked again.
+  @Published var gameNeedsLink = false
+  private var gameSignInTried = false
+  var activeGame: GameSession { guestView ? guestGame : game }
+  /// A request changed something, so the game should load the scene again.
+  private var gameStale = false
   private var statusTimer: Timer?
   private var runTask: Task<Void, Never>?
   /// Bumped to send keyboard focus back to the input.
@@ -93,6 +109,69 @@ final class PortalModel: ObservableObject {
       Task { @MainActor in self?.pollPictures() }
     }
     pollPictures()
+    game.onScene = { [weak self] id in Task { await self?.focusChanged(to: id, fromGame: true) } }
+    guestGame.onScene = { [weak self] id in Task { await self?.focusChanged(to: id, fromGame: true) } }
+    game.onPlayer = { [weak self] name in if name.isEmpty { Task { await self?.signGameIn() } } }
+  }
+
+  /// The game came up as a guest while this Mac is linked: sign it in as the same account, once.
+  private func signGameIn() async {
+    guard signedIn, !gameSignInTried else { return }
+    gameSignInTried = true
+    switch await portal.auth.gameSignIn() {
+    case .url(let url):
+      gameNeedsLink = false
+      game.signIn(with: url, then: focus?.id)
+    case .needsPermission: gameNeedsLink = true
+    case .notLinked: break
+    case .unavailable(let why): receive(.info("The game could not be signed in for you (\(why)). You can still sign in inside it."))
+    }
+  }
+
+  func setGuestView(_ guest: Bool) {
+    guard guest != guestView else { return }
+    let scene = activeGame.sceneId ?? focus?.id
+    guestView = guest
+    activeGame.show(scene)
+  }
+
+  // MARK: Game
+
+  func setGame(_ shown: Bool) {
+    chatHidden = false
+    guard shown != gameShown else { return }
+    gameShown = shown
+    if shown { activeGame.show(focus?.id) } else if focus != nil, preview == nil { Task { await refreshPreview() } }
+  }
+
+  func openGameInBrowser() {
+    NSWorkspace.shared.open(activeGame.address ?? focus.map { environment.origin.appendingPathComponent($0.id) } ?? environment.origin)
+  }
+
+  /// `/game`, `/game on|off|reload`, `/game <scene id>`: handled here because the game lives in the window.
+  private func gameCommand(_ argument: String) {
+    switch argument {
+    case "": setGame(!gameShown)
+    case "guest":
+      setGame(true)
+      setGuestView(true)
+    case "me":
+      setGame(true)
+      setGuestView(false)
+    case "on", "show": setGame(true)
+    case "off", "hide": setGame(false)
+    case "reload":
+      setGame(true)
+      activeGame.reload()
+    default:
+      guard GameSession.isSceneId(argument) else {
+        receive(.error("Usage: /game [on|off|reload|guest|me|<scene id>]"))
+        return
+      }
+      setGame(true)
+      activeGame.show(argument)
+    }
+    receive(.info(!gameShown ? "The game is hidden." : guestView ? "Showing the game as a guest: what a visitor sees." : "The game is showing beside the chat. Walking to a scene makes it “this scene” here."))
   }
 
   // MARK: Picture engine
@@ -245,6 +324,11 @@ final class PortalModel: ObservableObject {
     folders = []
     focus = nil
     preview = nil
+    game.use(origin: environment.origin)
+    guestGame.use(origin: environment.origin)
+    gameSignInTried = false
+    gameNeedsLink = false
+    if gameShown { activeGame.show(nil) }
     Task {
       localBrain = await LocalBrain.check()
       await refreshAccount()
@@ -260,6 +344,11 @@ final class PortalModel: ObservableObject {
     guard !startupScriptDone, let script = ProcessInfo.processInfo.environment["TWP_PORTAL_RUN"] else { return }
     startupScriptDone = true
     for line in script.split(separator: "\n").map(String.init) {
+      // "sleep 5" pauses the script (lets the game finish loading between steps).
+      if line.hasPrefix("sleep "), let seconds = Double(line.dropFirst(6)) {
+        try? await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
+        continue
+      }
       run(line)
       while busy { try? await Task.sleep(nanoseconds: 200_000_000) }
     }
@@ -358,7 +447,13 @@ final class PortalModel: ObservableObject {
     historyIndex = nil
     entries.append(Entry(kind: .user, text: line))
     startersRequested = false
+    let words = line.split(separator: " ").map(String.init)
+    if words.first == "/game" {
+      gameCommand(words.dropFirst().joined(separator: " "))
+      return
+    }
     busy = true
+    gameStale = false
     linking = line.trimmingCharacters(in: .whitespaces) == "/login"
     // Commands that put a picture on the shelf bring the shelf into view.
     if ["/imagine", "/cutout", "/import", "/local", "/edit", "/fill"].contains(line.split(separator: " ").first.map(String.init) ?? "") { sidebarTab = .local }
@@ -376,8 +471,18 @@ final class PortalModel: ObservableObject {
       await withCheckedContinuation { c in DispatchQueue.main.async { c.resume() } }
       busy = false
       let word = line.split(separator: " ").first.map(String.init) ?? ""
+      // Unlinking signs the game out too; linking (again) lets it sign in as the linked account.
+      if word == "/logout" { game.signOut() }
+      if word == "/login" {
+        gameSignInTried = false
+        gameNeedsLink = false
+      }
       if ["/login", "/logout"].contains(word) || !line.hasPrefix("/") || ["/call", "/whoami"].contains(word) { await refreshAccount() }
-      if !line.hasPrefix("/") || word == "/call", focus != nil { await refreshPreview() }
+      if word == "/login", gameShown, game.player == "" { await signGameIn() }
+      if !line.hasPrefix("/") || word == "/call", focus != nil {
+        // The game is the preview while it shows; load it again only when something was changed.
+        if gameShown { if gameStale { activeGame.reload() } } else { await refreshPreview() }
+      }
     }
   }
 
@@ -401,7 +506,9 @@ final class PortalModel: ObservableObject {
     case .info(let t): entries.append(Entry(kind: .info, text: t))
     case .error(let t): entries.append(Entry(kind: .error, text: t))
     case .assistant(let t): entries.append(Entry(kind: .assistant, text: t))
-    case .toolCall(let name, let args): entries.append(Entry(kind: .toolCall, text: "\(name) \(args == "{}" ? "" : args)"))
+    case .toolCall(let name, let args):
+      if !(name.hasPrefix("get_") || name.hasPrefix("list_") || name.hasPrefix("render_") || name.hasPrefix("view_") || ["whoami", "api_catalog"].contains(name)) { gameStale = true }
+      entries.append(Entry(kind: .toolCall, text: "\(name) \(args == "{}" ? "" : args)"))
     case .toolResult(let name, let text, let isError):
       let flat = text.replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression)
       entries.append(Entry(kind: isError ? .toolError : .toolResult, text: "\(name): \(flat.prefix(220))\(flat.count > 220 ? "…" : "")"))
@@ -425,12 +532,14 @@ final class PortalModel: ObservableObject {
       return
     }
     portal.agent.focusScene = (scene.id, scene.name)
-    Task { await refreshPreview() }
+    if gameShown { activeGame.show(scene.id) } else { Task { await refreshPreview() } }
   }
 
-  private func focusChanged(to id: String) async {
+  /// The agent moved on to a scene, or (fromGame) the player walked to one in the game.
+  private func focusChanged(to id: String, fromGame: Bool = false) async {
+    if gameShown, !fromGame { activeGame.show(id) }
     if focus?.id == id { return }
-    defer { Task { await refreshPreview() } }
+    defer { if !gameShown { Task { await refreshPreview() } } }
     if !scenes.contains(where: { $0.id == id }) { scenes = (try? await portal.scenes()) ?? scenes }
     if let scene = scenes.first(where: { $0.id == id }) {
       reveal(scene)
